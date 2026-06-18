@@ -1,0 +1,41 @@
+# ── ENERVERA CBC — unified dependencies for the whole project ──
+# One environment for Layer 1 (OCR extraction) + Layer 2 (normalization).
+# Install in a clean venv WITHOUT torch (paddle and torch clash on Windows).
+
+# ── Layer 1 — OCR extraction (ocr/) ──
+pdfplumber>=0.10.0
+pymupdf>=1.23.0
+paddleocr>=2.7,<3.0
+paddlepaddle>=2.5,<3.0
+truststore>=0.9            # OS trust store for model download behind corporate proxy
+opencv-python>=4.8.0
+pillow>=10.0.0
+numpy>=1.24.0
+
+# ── Layer 2 — Normalization (backend/, knowledge-graph-first) ──
+sqlalchemy>=2.0
+alembic>=1.13
+psycopg2-binary>=2.9       # sync driver — used by Alembic migrations
+asyncpg>=0.29              # async driver — used by the app (AsyncSession lookups)
+aiosqlite>=0.19            # async SQLite — used by tests
+rapidfuzz>=3.6             # OCR-tolerant biomarker name matching
+pydantic>=2.5
+pydantic-settings>=2.1
+python-dotenv>=1.0
+
+# ── Layer 4 — Graph reasoning ──
+neo4j>=5.14               # async Neo4j driver (AsyncGraphDatabase)
+
+# ── Layer 6 — LLM presentation (Gemini API) ──
+google-genai              # Google Gemini SDK — configured provider (GeminiLLMClient)
+# anthropic               # optional alternative provider (AnthropicLLMClient); not needed for Gemini
+
+# ── API (shared) ──
+fastapi>=0.104
+uvicorn[standard]>=0.24
+python-multipart>=0.0.6
+
+# ── Tests ──
+pytest>=8.0
+pytest-asyncio>=0.23      # async test support (reference lookup / normalizer)
+pytest-cov>=4.1           # coverage reporting

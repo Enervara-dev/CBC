@@ -1,0 +1,53 @@
+# ── Secrets — NEVER commit ──
+.env
+.env.*
+!.env.example
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.installed.cfg
+*.egg
+
+# ── Virtual environments ──
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# ── Test / coverage ──
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ── Runtime artifacts ──
+out/
+outputs/
+*.log
+tmp/
+*.tmp
+
+# ── OCR model caches / large binaries ──
+.paddleocr/
+paddle_models/
+*.onnx
+
+# ── OS / editor ──
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

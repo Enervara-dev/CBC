@@ -1,0 +1,34 @@
+# ── ENERVERA CBC — BACKEND service dependencies (Layers 2→6) ──
+# This service runs the knowledge-graph pipeline + LLM presentation. It does NOT
+# do OCR (paddle/torch clash and are heavy); OCR is a separate microservice (see
+# ../ocr/requirements.txt) reached over HTTP.
+
+# ── Layer 2 — Normalization / DB ──
+sqlalchemy>=2.0
+alembic>=1.13
+psycopg2-binary>=2.9       # sync driver — used by Alembic migrations
+asyncpg>=0.29              # async driver — used by the app (AsyncSession lookups)
+aiosqlite>=0.19            # async SQLite — used by tests / local runs
+rapidfuzz>=3.6             # OCR-tolerant biomarker name matching
+pydantic>=2.5
+pydantic-settings>=2.1
+python-dotenv>=1.0
+
+# ── Layer 4 — Graph reasoning ──
+neo4j>=5.14               # async Neo4j driver (AsyncGraphDatabase)
+
+# ── Layer 6 — LLM presentation (Gemini API) ──
+google-genai              # Google Gemini SDK — configured provider (GeminiLLMClient)
+truststore>=0.9           # OS trust store for Gemini TLS behind a corporate proxy
+# anthropic               # optional alternative provider (AnthropicLLMClient)
+
+# ── API + OCR-service client ──
+fastapi>=0.104
+uvicorn[standard]>=0.24
+python-multipart>=0.0.6   # multipart upload for /api/analyze-file
+httpx>=0.27               # calls the OCR microservice (/extract)
+
+# ── Tests ──
+pytest>=8.0
+pytest-asyncio>=0.23
+pytest-cov>=4.1
