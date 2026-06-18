@@ -20,7 +20,11 @@ only layer that uses an LLM, and strictly as a presentation step.
 | **3 — Feature Generation**    | values → clinical **facts** (binary / severity / ratio) — no disease inference                                                                | `backend/src/services/feature_generation/`    | in-code definitions              |
 | **4 — Graph Reasoning**       | **facts + values → inferred diseases**, evidence, conflicts, recommendations (traverses the existing `Biomarker → Threshold → Disease` graph) | `backend/src/services/graph_reasoning/`       | Neo4j (clinical knowledge graph) |
 | **5 — Confidence Validation** | findings → validated, calibrated, urgency-flagged, clinician-ready output                                                                     | `backend/src/services/confidence_validation/` | in-code rules                    |
-| **6 — LLM Presentation**      | validated findings → patient + clinician reports (LLM, presentation only) + deterministic JSON/HL7/CSV/PDF exports (no LLM)                    | `backend/src/services/presentation/`          | Gemini API (`gemini-2.0-flash`)  |
+| **6 — LLM Presentation**      | validated findings → patient + clinician reports (LLM, presentation only) + deterministic JSON/HL7/CSV/PDF exports (no LLM)                    | `backend/src/services/presentation/`          | Gemini API (`gemini-2.5-flash`)  |
+
+All **per-panel knowledge** (codes, LOINC, aliases, features, validation rules,
+reference ranges) is consolidated in `backend/src/domains/<panel>/` (§3a) so a new
+specialty is a folder copy, not a pipeline edit.
 
 **Tech stack:** Python 3.11 · PaddleOCR / pdfplumber / PyMuPDF (L1) ·
 PostgreSQL + SQLAlchemy 2 + Alembic (L2) · Neo4j 5 (L4) · Pydantic v2 (contracts)
@@ -89,11 +93,17 @@ What the backend pipeline (`CBCFileAnalyzer`) actually uses from `ocr/`:
   into rows (by y), parses each row → `[{name, value, unit, confidence}]`. PaddleOCR
   is imported lazily, so importing this module does not require PaddleOCR installed.
 
+`ocr/api/main.py` is the **OCR microservice** (deployed separately — see §8). Its
+**`POST /extract`** runs `PaddleOCRExtractor` and returns the rows; this is what the
+backend's `RemoteOCRExtractor` calls in the two-service deployment. (Its older
+`POST /analyze` endpoint drives the legacy standalone OCR app below and is not on
+the Layers 2–5 path.)
+
 Not used by the backend pipeline (a **separate, self-contained OCR application**,
 kept in the repo): `core/stage3_parser`…`stage7_summary` (config-driven parse →
-flag → rule-based condition scoring → template summary), `core/pipeline.py`,
-`ocr/api/main.py`, and `run_extraction_test.py`. These were built mainly for the
-LFT panel and are exercised independently of Layers 2–5.
+flag → rule-based condition scoring → template summary), `core/pipeline.py`, the
+legacy `/analyze` endpoint, and `run_extraction_test.py`. These were built mainly
+for the LFT panel and are exercised independently of Layers 2–5.
 
 ### Layer 2 — Normalization (`backend/src/services/normalization/`)
 
@@ -117,14 +127,13 @@ LFT panel and are exercised independently of Layers 2–5.
 
 ### Layer 3 — Feature Generation (`backend/src/services/feature_generation/`) — FACTS ONLY
 
-- `feature_definitions.py` — feature library: BINARY (21), SEVERITY (3), RATIO (5).
-  The PATTERN (7) + anemia-subtype (5) definitions remain only as legacy reference
-  data; they are not used at runtime.
+- `feature_definitions.py` — thin re-export shim; the actual feature library now
+  lives in **`domains/cbc/features.py`** (see §3a): BINARY (21), SEVERITY (3),
+  RATIO (5). The PATTERN (7) + anemia-subtype (5) definitions remain only as legacy
+  reference data; they are not used at runtime.
 - `feature_generator.py` — **FeatureGenerator** (async): binary flags → severity
   bands → ratios. **No pattern matching / disease inference** — that moved to Layer 4.
 - `severity_classifier.py` — **SeverityClassifier** (static): value → band.
-- `pattern_matcher.py` — **deprecated/legacy**, not wired into any path (disease
-  inference is graph-based). Retained for reference; safe to delete.
 
 ### Layer 4 — Graph Reasoning (`backend/src/services/graph_reasoning/`) — KG TRAVERSAL
 
@@ -145,11 +154,13 @@ nodes, no hardcoded disease patterns.
   evidence chains, then recommendations + conflicts; 5 steps, per-step error
   isolation, full audit trail. Does **not** consume `detected_patterns`.
 - `biomarker_mappings.py` — **BiomarkerFactMapping**: bridges fact id ↔ canonical
-  code (`hemoglobin_low` → `HGB`) ↔ graph `Biomarker.name` (`hemoglobin`).
+  code (`hemoglobin_low` → `HGB`) ↔ graph `Biomarker.name` (`hemoglobin`). The
+  tables themselves now live in **`domains/cbc/biomarkers.py`** (see §3a).
 
 ### Layer 5 — Confidence Validation (`backend/src/services/confidence_validation/`)
 
-- `validation_rules.py` — **rule catalogue**: `SEVERITY_THRESHOLDS`,
+- `validation_rules.py` — thin re-export shim; the **rule catalogue** now lives in
+  **`domains/cbc/validation.py`** (see §3a): `SEVERITY_THRESHOLDS`,
   `CLINICAL_VALIDATION_RULES`, `IMPOSSIBLE_CONDITIONS`, `CONFIDENCE_CALIBRATION`,
   `URGENCY_FLAGS`, the `ClinicalRule` dataclass, and `load_validation_rules()`.
 - `confidence_calibrator.py` — **ConfidenceCalibrator**: impossibility checks,
@@ -186,10 +197,10 @@ references.
 ### Contracts (`backend/src/models/`)
 
 - `normalization_schemas.py` — `NormalizedBiomarker`, `PatientMetadata`, …
-- `feature_schemas.py` — `GeneratedFeature`, `PatternMatch`, `FeatureGenerationResult`, `Layer3Output`.
+- `feature_schemas.py` — `GeneratedFeature`, `PatternMatch`, `FeatureGenerationResult`, `Layer3Output`
+  (`PatternMatch` is part of the contract but unused at runtime — inference is Layer 4).
 - `graph_schemas.py` — `EvidenceLink`, `ValidatedFinding`, `Recommendation`, `ConflictAlert`, `AuditTrail`, `Layer4Output`.
 - `validation_schemas.py` — `FinalFinding`, `ClinicalFlag`, `ValidationAuditTrail`, `Layer5Output`.
-- `schemas.py` — **unused TODO stub** (superseded by `normalization_schemas.py`); not imported anywhere.
 - `report_schemas.py` — `PatientReport`, `ClinicianReport`, `ReportExports`, `ReportBundle` (Layer 6).
 
 ### Orchestration (`backend/src/orchestration/`)
@@ -202,10 +213,15 @@ references.
   **dataclasses** into the Pydantic `Layer3Output` the graph layer consumes.
 - `layer1_adapter.py` — **Layer1ToLayer2Adapter** (static) + `OCRRow`: maps OCR
   rows → `{code: value}` by exact / fuzzy (`difflib`) / substring name resolution
-  (e.g. `Hemoglobin`/`Hgb`/`RDW-CV` → `HGB`/`RDW`).
+  (e.g. `Hemoglobin`/`Hgb`/`RDW-CV` → `HGB`/`RDW`). Its alias table
+  (`BIOMARKER_LOOKUP`) is sourced from `domains/cbc/biomarkers.py`.
 - `cbc_file_analyzer.py` — **CBCFileAnalyzer** (async): the full file→findings
   pipeline (validate file → OCR → adapter → orchestrator), threading Layer 1 into
-  the audit trail.
+  the audit trail. The injected `ocr_extractor` may be the local `PaddleOCRExtractor`
+  or the `RemoteOCRExtractor` (same interface).
+- `remote_ocr_client.py` — **RemoteOCRExtractor**: drop-in OCR extractor that POSTs
+  the file to the OCR microservice's `POST /extract` (via `OCR_SERVICE_URL`) and
+  returns the rows, so the backend never imports paddle. Used by `/api/analyze-file`.
 
 ### API (`backend/src/api/`)
 
@@ -215,6 +231,10 @@ references.
   errors, timing). HTTP: 400 (empty / <3 biomarkers or `ValueError`), 503
   (orchestrator/DB not initialized), 500 (unexpected); a graceful `status="error"`
   still returns 200 with the audit trail. Plus `GET /api/health`.
+  **`POST /api/analyze-file`** (multipart): upload a PDF/image → the file is sent to
+  the OCR microservice (`OCR_SERVICE_URL`), the rows are mapped to canonical codes
+  (Layer 1→2 adapter), then run through the same orchestrator; same response shape,
+  plus 502 (OCR service unreachable) and 422 (no biomarkers resolved).
   **DI:** the orchestrator + stateless L3–L5 are app-lifetime singletons; the
   `get_db` dependency yields a **fresh `AsyncSession` per request** (an
   `AsyncSession` is not safe to share concurrently), and a registered normalizer
@@ -226,6 +246,31 @@ references.
   DB and Neo4j init are both **best-effort**: a DB failure → `/api/analyze` 503s;
   Neo4j down → Layer 4 degrades to `partial`; neither kills startup. Shutdown
   disposes the engine + Neo4j driver. Run from `backend/src`: `uvicorn api.main:app`.
+
+### 3a. Domains — per-panel knowledge (`backend/src/domains/`)
+
+All knowledge that is **specific to a lab panel** lives here, so the 6-layer
+pipeline stays generic and adding a specialty (LFT, Lipid, …) is a folder copy,
+not a pipeline edit. (See `domains/README.md` for the step-by-step guide.)
+
+- `base.py` — **`DomainConfig`** dataclass: the contract every panel fulfils
+  (required panel, name/LOINC/alias vocab, graph bridge, feature registry,
+  validation-rule loader, reference-range rows).
+- `registry.py` — **`get_domain(key)`** / `available_domains()`; the single place
+  that lists registered specialties.
+- `cbc/` — the reference implementation:
+  - `biomarkers.py` — `REQUIRED_BIOMARKERS`, `NAME_TO_CODE`, `CODE_TO_NAME`,
+    `BIOMARKER_LOOKUP` (OCR aliases), **`CODE_TO_LOINC`**, `FACT_TO_BIOMARKER`,
+    `CODE_TO_GRAPH_NAMES`. **Single source of truth** — the normalizer, Layer-1
+    adapter, `BiomarkerFactMapping`, and the orchestrator all import from here.
+  - `features.py` — Layer-3 `FEATURE_REGISTRY` (the old `feature_definitions.py`).
+  - `validation.py` — Layer-5 rule catalogue (the old `validation_rules.py`).
+  - `reference_ranges.py` — `reference_range_rows()` consumed by `db.seeds`.
+  - `__init__.py` — assembles the `DOMAIN: DomainConfig`.
+- `_template/` — copy-to-start scaffold for a new panel (empty tables + a `DOMAIN`).
+
+The former `services/.../feature_definitions.py` and `.../validation_rules.py`
+remain as **thin re-export shims** so existing imports keep working.
 
 ---
 
@@ -338,26 +383,26 @@ environment (missing dependency / service).
 
 | Area                                                                                                | Status                                                                                                                                                                                                                                                 |
 | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Layer 2 — services (UnitConverter, ReferenceRangeLookup, DataQualityChecker, DataNormalizer)        | ✅ **Tested** — 35 tests (`test_normalization_layer2.py`) against in-memory SQLite. Includes **LOINC normalization** (`CODE_TO_LOINC` → `NormalizedBiomarker.loinc_code`), verified to tag e.g. HGB `718-7`.                                            |
+| Layer 2 — services (UnitConverter, ReferenceRangeLookup, DataQualityChecker, DataNormalizer)        | ✅ **Tested** — 37 tests (`test_normalization_layer2.py`) against in-memory SQLite. Includes **LOINC normalization** (`domains/cbc/biomarkers.CODE_TO_LOINC` → `NormalizedBiomarker.loinc_code`), verified to tag e.g. HGB `718-7`.                                            |
 | Layer 2 — DB (models, idempotent seeds, Alembic)                                                    | ✅ **Built** — `db/models.py` (`ReferenceRange`), `db/seeds.py`, one Alembic migration (`init_reference_range`). ⏳ **Not run here** — migrate + seed on real PostgreSQL is the operator's step (`alembic upgrade head` + `python -m db.seed_runner`). |
-| Layer 3 — feature generation (facts only)                                                           | ✅ **Tested** — 33 tests (`test_feature_generation_layer3.py`). Binary/severity/ratio; no disease inference.                                                                                                                                           |
+| Layer 3 — feature generation (facts only)                                                           | ✅ **Tested** — 26 tests (`test_feature_generation_layer3.py`). Binary/severity/ratio; no disease inference.                                                                                                                                           |
 | Layer 4 — graph reasoning (KG traversal, no InferenceRule)                                          | ✅ **Tested** — 15 tests (`test_graph_reasoning_layer4.py`, fake Neo4j). ✅ **Live-verified** against the configured Neo4j (mild/severe/high HGB + multi-marker iron-deficiency returned correct findings + recommendations).                          |
 | Layer 5 — validation rules + calibrator + engine                                                    | ✅ **Tested** — 8 tests (`test_validation.py`).                                                                                                                                                                                                        |
 | Pydantic contracts (L2–L5)                                                                          | ✅ **Built** — schemas defined and used across the layers (`models/*_schemas.py`).                                                                                                                                                                     |
 | Orchestration — `CBCOrchestrator` (L2→L5) + `CBCFileAnalyzer` (file→findings) + `layer1_adapter.py` | ✅ **Built**; per-layer error isolation. ⏳ No committed orchestration test suite; not run end-to-end against live DB+Neo4j in this env.                                                                                                               |
 | Layer 1 — `PaddleOCRExtractor` + OCR engine (`ocr/`)                                                | ✅ **Built** (PaddleOCR imported lazily). ⏳ **Not run here** — PaddleOCR is not installed in this dev env, so the OCR→rows path was not executed against a real PDF this session.                                                                     |
 | File-analysis CLI — `analyze_report.py`                                                             | ✅ **Built** — runs all six layers (OCR → L2–L5 → Layer 6 reports + exports), flags `--no-reports`/`--model`/`--out-dir`. The **L2→L6 tail is live-verified** (live Neo4j + Gemini). ⏳ The L1 OCR + Postgres front is **not run here** (no PaddleOCR / Postgres in this dev env). |
-| FastAPI endpoint — `POST /api/analyze`, `GET /api/health` (`api/routes.py`, `api/main.py`)          | ✅ **Built**; per-request `AsyncSession` DI, lifespan wiring, best-effort DB/Neo4j init. ⏳ No committed API test suite.                                                                                                                               |
+| FastAPI endpoints — `POST /api/analyze`, **`POST /api/analyze-file`**, `GET /api/health` (`api/routes.py`, `api/main.py`) | ✅ **Built**; per-request `AsyncSession` DI, lifespan wiring, best-effort DB/Neo4j init. `/api/analyze-file` calls the OCR microservice via `RemoteOCRExtractor`. ⏳ No committed API test suite; the file path is not run end-to-end in this env (no OCR service / PaddleOCR). |
 | Layer 6 — LLM presentation (`services/presentation/`) | ✅ **Tested** with a fake LLM (`test_presentation_layer6.py`) **and live-verified** against the configured Gemini key (`gemini-2.5-flash`, thinking disabled): patient + clinician reports + exports produced from real graph-derived findings. Provider Gemini (low temperature, safety-block handling, `truststore` for proxy TLS); `AnthropicLLMClient` is a drop-in alternative. |
 | Layer 6 — deterministic exports (JSON/HL7v2/CSV/PDF-metadata) | ✅ **Tested** — pure functions over validated data; no LLM; deterministic. |
-| **Tests total**                                                                                     | ✅ **107 passing** (`pytest` in `backend/`): L2 35 · L3 33 · L4 15 · L5 8 · L6 16. The `ocr/` suite needs the OCR env and is not run with the backend suite.                                                                                                    |
+| **Tests total**                                                                                     | ✅ **102 passing** (`pytest` in `backend/`): L2 37 · L3 26 · L4 15 · L5 8 · L6 16. The `ocr/` suite needs the OCR env and is not run with the backend suite.                                                                                                    |
 
 **Legacy / not in the runtime path** (present in the repo, intentionally unused):
-`feature_generation/pattern_matcher.py` and the PATTERN/anaemia-subtype
-`FeatureDefinition`s (disease inference moved to Layer 4); `ocr/core/stage3–7` +
-`ocr/api` + `ocr/core/pipeline.py` (standalone OCR app); `models/schemas.py` and
-`backend/tests/test_normalization.py` (TODO stubs superseded by the `*_layer2`
-versions).
+the PATTERN/anaemia-subtype `FeatureDefinition`s in `domains/cbc/features.py`
+(disease inference moved to Layer 4); the legacy standalone OCR app
+(`ocr/core/stage3–7` + `ocr/api`'s `/analyze` + `ocr/core/pipeline.py`) — the new
+extraction path is `PaddleOCRExtractor` + the OCR service's `/extract`.
+(`pattern_matcher.py` and `models/schemas.py` have been removed.)
 
 **Graph notes (data, not code):** Layer 4 reasons over whatever is in the live
 graph (seeded externally; we only read it via `NEO4J_URI`). Two data-side limits,
@@ -377,23 +422,52 @@ Layer 6 reads `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) from `.env`/env for the Gem
 
 ## 7. Future extensibility (CBC, LFT, Lipid, Thyroid, Diabetes)
 
-The architecture is **panel-agnostic**: adding a panel is adding data at each
-layer, not rewriting logic.
+The architecture is **panel-agnostic**: adding a panel is adding data in one
+`domains/<panel>/` folder, not rewriting logic. Copy `domains/_template`, fill in
+the four data modules, and register the new `DOMAIN` in `domains/registry.py`
+(full walkthrough in `backend/src/domains/README.md`).
 
-| Layer                 | What to add for a new panel                                                                                                                                                                                                                                                        |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1 — Extraction**    | OCR reads any report's text; add biomarker name aliases (Layer-1 `layer1_adapter.py` / Layer-2 name map) for the panel's headers.                                                                                                                                                  |
-| **2 — Normalization** | Biomarker codes + name aliases, unit conversion factors, and **reference ranges** (seed rows, sex/age/condition-stratified).                                                                                                                                                       |
-| **3 — Features**      | `FeatureDefinition`s for the panel: binary thresholds, severity bands, ratios (facts only — no disease patterns).                                                                                                                                                                  |
-| **4 — Graph**         | `Biomarker → Disease/Finding` edges (`INDICATES` / `ASSOCIATED_WITH`, or via `Threshold` with `operator`+`value`+`unit`), `Recommendation -[INDICATES]->` / `-[REQUIRES_TEST]-> FollowUpTest`, plus a fact→code→graph-name entry in `biomarker_mappings.py` for any new biomarker. |
-| **5 — Validation**    | Severity thresholds, validation rules, and impossible-condition pairs for the panel's findings (in `validation_rules.py`).                                                                                                                                                         |
-| **6 — Presentation**  | Usually nothing — the prompts and exporters are panel-agnostic and operate on the validated-findings contract. Adjust prompt wording only if a panel needs different report sections.                                                                                               |
+| File in `domains/<panel>/` | Feeds layer(s) | What to add for a new panel                                                                                                              |
+| -------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `biomarkers.py`            | 1, 2, 4        | Canonical codes, name aliases (OCR headers), unit/LOINC vocab, the fact→code→graph-name bridge, and the required panel.                  |
+| `reference_ranges.py`      | 2              | Reference ranges as seed rows (sex/age/condition-stratified).                                                                           |
+| `features.py`              | 3              | `FeatureDefinition`s for the panel: binary thresholds, severity bands, ratios (facts only — no disease patterns).                       |
+| `validation.py`            | 5              | Severity thresholds, validation rules, and impossible-condition pairs for the panel's findings.                                         |
+
+Two things still live **outside** the domain folder: the **graph** (Layer 4 reads
+`Biomarker → Disease/Finding` edges from Neo4j — add graph data, no code change),
+and **Layer 6** (prompts + exporters are panel-agnostic over the validated-findings
+contract; adjust prompt wording only if a panel needs different report sections).
 
 Because each layer keys off a canonical biomarker code and reads its knowledge
-from data (reference tables, feature definitions, graph), the same engine can serve
-other panels (LFT, Lipid, Thyroid, Diabetes) once their reference data, feature
-definitions, and graph subgraphs are added. Multi-panel reports are handled per
-biomarker by normalization and feature generation.
+from the domain config, the same engine serves other panels (LFT, Lipid, Thyroid,
+Diabetes) once their domain folder and graph subgraph are added. Multi-panel
+reports are handled per biomarker by normalization and feature generation.
+
+---
+
+## 8. Deployment (Render — two microservices)
+
+OCR is heavy (PaddleOCR) and clashes with torch, so it is deployed as a **separate
+service** from the backend; the backend reaches it over HTTP.
+
+| Service             | Root      | Start command                                  | Health        | Heavy deps |
+| ------------------- | --------- | ---------------------------------------------- | ------------- | ---------- |
+| `enervera-ocr`      | `ocr/`    | `uvicorn api.main:app --host 0.0.0.0 --port $PORT` | `/health`     | PaddleOCR  |
+| `enervera-backend`  | `backend/`| `uvicorn src.api.main:app --host 0.0.0.0 --port $PORT` | `/api/health` | —          |
+
+- **`render.yaml`** (repo root) declares both services; secrets (`DATABASE_URL`,
+  `NEO4J_*`, `GEMINI_API_KEY`, `OCR_SERVICE_URL`) are `sync:false` — set them in the
+  Render dashboard, never in git.
+- Per-service deps: `ocr/requirements.txt` (paddle, opencv, pdfplumber, pymupdf)
+  and `backend/requirements.txt` (no paddle; adds `httpx` for the OCR client +
+  `google-genai`). The root `requirements.txt` is the unified set for **local**
+  end-to-end runs of `analyze_report.py`.
+- Flow: `POST /api/analyze-file` (backend) → `POST /extract` (OCR) → rows → Layer
+  1→2 adapter → orchestrator. Set `OCR_SERVICE_URL` to the OCR service's public URL.
+- **DB setup** (operator, once): `alembic upgrade head` then `python -m db.seed_runner`
+  against PostgreSQL.
+- **Secrets:** `.gitignore` excludes `.env`; `.env.example` documents every var.
 
 **Design note (Layer 4 ↔ Layer 5 separation):** Layer 4 emits candidate
 biomarker→disease/finding paths from the graph — including non-directional ones
