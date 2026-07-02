@@ -54,20 +54,28 @@ class UnitConverter:
         "wbc":        {"K/uL": 1.0, "10^3/uL": 1.0, "10^9/L": 1.0},
         "mcv":        {"fL": 1.0, "um^3": 1.0},
         "mch":        {"pg": 1.0, "fmol": 0.0621},
+        "mchc":       {"g/dL": 1.0, "g/L": 0.1},
         "rbc":        {"M/uL": 1.0, "10^6/uL": 1.0, "10^12/L": 1.0},
         "platelets":  {"K/uL": 1.0, "10^3/uL": 1.0, "10^9/L": 1.0},
+        "hematocrit": {"%": 1.0, "L/L": 100.0, "fraction": 100.0},
         "rdw":        {"%": 1.0},
+        "neutrophils": {"%": 1.0},
+        "lymphocytes": {"%": 1.0},
     }
 
-    # standard (canonical) unit per biomarker — the one annotated "(standard)"
+    # standard (canonical) unit per biomarker — the one with factor 1.0
     STANDARD_UNITS: Dict[str, str] = {
         "hemoglobin": "g/dL",
         "wbc": "K/uL",
         "mcv": "fL",
         "mch": "pg",
+        "mchc": "g/dL",
         "rbc": "M/uL",
         "platelets": "K/uL",
+        "hematocrit": "%",
         "rdw": "%",
+        "neutrophils": "%",
+        "lymphocytes": "%",
     }
 
     @staticmethod

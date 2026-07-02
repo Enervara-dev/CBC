@@ -42,16 +42,20 @@ from api.routes import (  # noqa: E402
     init_db,
     init_normalizer_factory,
     init_orchestrator,
+    init_report_generator,
     router,
 )
 from db.config import get_settings  # noqa: E402
 from db.session import get_async_engine  # noqa: E402
 from orchestration.cbc_orchestrator import CBCOrchestrator  # noqa: E402
+from services.presentation.llm_client import GeminiLLMClient  # noqa: E402
+from services.presentation.report_generator import ReportGenerator  # noqa: E402
 from services.confidence_validation.confidence_calibrator import ConfidenceCalibrator  # noqa: E402
 from services.confidence_validation.validation_engine import ConfidenceValidationEngine  # noqa: E402
 from services.confidence_validation.validation_rules import load_validation_rules  # noqa: E402
 from services.feature_generation.feature_definitions import FEATURE_REGISTRY  # noqa: E402
 from services.feature_generation.feature_generator import FeatureGenerator  # noqa: E402
+from services.graph_reasoning.graph_contract import load_contract  # noqa: E402
 from services.graph_reasoning.neo4j_connection import Neo4jConnection  # noqa: E402
 from services.graph_reasoning.reasoning_engine import GraphReasoningEngine  # noqa: E402
 from services.normalization.normalizer import DataNormalizer  # noqa: E402
@@ -95,14 +99,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # ── Layer 3 — feature generation (stateless singleton)
         layer3_feature_gen = FeatureGenerator(FEATURE_REGISTRY)
 
-        # ── Layer 4 — graph reasoning (Neo4j connect best-effort)
+        # ── Layer 4 — graph reasoning (contract-driven; Neo4j connect best-effort)
         neo4j = Neo4jConnection()
         try:
             await neo4j.connect()
             logger.info("Neo4j connected.")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Neo4j unavailable at startup (%s); Layer 4 will degrade.", exc)
-        layer4_graph_reasoner = GraphReasoningEngine(neo4j_connection=neo4j, logger=logger)
+        # Load the shared Graph Contract once at startup. An incompatible contract
+        # raises here (fail fast) rather than silently returning zero findings.
+        graph_contract = load_contract()
+        logger.info("Graph Contract loaded: v%s (%s)",
+                    graph_contract.version, graph_contract.source_path)
+        layer4_graph_reasoner = GraphReasoningEngine(
+            neo4j_connection=neo4j, logger=logger, contract=graph_contract,
+        )
 
         # ── Layer 5 — confidence validation (stateless singleton)
         rules = load_validation_rules()
@@ -123,6 +134,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         init_orchestrator(orchestrator)
         app.state.neo4j = neo4j
         logger.info("CBC orchestrator initialized.")
+
+        # ── Layer 6 — LLM presentation (best-effort; needs GEMINI_API_KEY)
+        if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+            init_report_generator(ReportGenerator(GeminiLLMClient(), logger=logger))
+            logger.info("Layer 6 report generator ready (GEMINI_API_KEY set).")
+        else:
+            init_report_generator(None)
+            logger.info("Layer 6 report generator disabled (no GEMINI_API_KEY); "
+                        "/api/analyze reports=unavailable.")
     except Exception:
         logger.exception("Failed to initialize the CBC pipeline.")
         if neo4j is not None:

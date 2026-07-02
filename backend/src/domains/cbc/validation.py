@@ -211,8 +211,9 @@ IMPOSSIBLE_CONDITIONS: Dict[str, Dict[str, Any]] = {
 #    Multipliers applied to a finding's confidence based on evidence quality.
 # ─────────────────────────────────────────────────────────────────────────────
 CONFIDENCE_CALIBRATION: Dict[str, Dict[str, float]] = {
-    # Higher-severity findings get MORE scrutiny → lower multiplier.
-    "hemoglobin_severity_factor": {
+    # Higher-severity findings get MORE scrutiny → lower multiplier. Applied to
+    # every finding (not hemoglobin-specific); bands follow WHO-style grading.
+    "severity_factor": {
         "critical": 0.85,
         "urgent": 0.90,
         "routine": 0.95,

@@ -1,0 +1,206 @@
+# =============================================================================
+# GRAPH CONTRACT — single source of truth for the Clinical Knowledge Graph.
+#
+# BOTH the ingestion pipeline and the reasoning engine (Layer 4) read this file.
+# Nothing about labels, relationships, directions, traversals, indexes or
+# constraints may be hard-coded independently anywhere else.
+#
+#   * Ingestion  -> pipeline/contract.py loads this; domains/_schema.py,
+#                   contract_validator.py, neo4j_loader.py and graph_builder.py
+#                   all derive their behaviour from it.
+#   * Reasoning  -> load the same file (pipeline/contract.py or any YAML reader)
+#                   to know which traversals/labels/properties it may rely on.
+#
+# Bump `contract_version` (semver) on ANY change. Consumers should assert the
+# major version they were written against.
+#
+# NOTE (reasoning side): this is a bundled copy kept in sync with the shared
+# contract published by the ingestion pipeline. Point GRAPH_CONTRACT_PATH at the
+# shared file to override this copy at runtime.
+# =============================================================================
+
+contract_version: "1.0.0"
+
+neo4j:
+  # Every node also carries this umbrella label so a single uniqueness
+  # constraint and id lookup works across all types.
+  umbrella_label: Entity
+
+# -----------------------------------------------------------------------------
+# Properties every node / every relationship must carry (by construction).
+# -----------------------------------------------------------------------------
+common_node_properties:
+  required: [id, name, type]
+  recommended: [sources] # JSON provenance (source docs per node)
+
+common_edge_properties:
+  required: [edge_id] # deterministic identity (src|type|tgt|condition)
+  recommended:
+    [
+      confidence,
+      condition,
+      source_pdf,
+      page,
+      chunk_id,
+      extraction_method,
+      derived,
+    ]
+
+# -----------------------------------------------------------------------------
+# Node labels. `neo4j_label` defaults to the label name. `required` /
+# `recommended` list per-type properties beyond the common ones. Missing a
+# required property is a HARD contract violation; a recommended one is SOFT.
+# -----------------------------------------------------------------------------
+node_labels:
+  - name: Biomarker
+    description: a measurable lab analyte (Hemoglobin, MCV, WBC, ...)
+    recommended: [loinc_code, unit, category]
+  - name: BiomarkerState
+    description: a directional state of one biomarker (low Hb, high MCV)
+    required: [biomarker, direction]
+  - name: Finding
+    description: a qualitative clinical observation (pancytopenia, abnormal smear)
+  - name: Morphology
+    description: a cell-morphology descriptor (microcytic, hypochromic)
+  - name: Disease
+    description: a named diagnosable disorder (iron deficiency anaemia)
+  - name: Cause
+    description: an etiology / risk factor / interferent (blood loss, dehydration)
+  - name: Artifact
+    description: a spurious / analytical result (spuriously elevated MCV)
+  - name: Threshold
+    description: a numeric decision cut-off for a biomarker
+    recommended: [biomarker, operator, value, unit]
+  - name: ReferenceRange
+    description: a numeric normal/categorised range for a biomarker
+    recommended: [biomarker, low, high, unit, category]
+  - name: Population
+    description: a group a threshold/range/recommendation applies to
+  - name: Recommendation
+    description: a clinical-interpretation action
+  - name: FollowUpTest
+    description: a further diagnostic test (serum ferritin)
+  - name: Guideline
+    description: a source guideline / document / publication
+  - name: Evidence
+    description: a cited study / reference supporting a statement
+
+# -----------------------------------------------------------------------------
+# Relationship types with authoritative DIRECTIONS. `from` / `to` are the
+# allowed endpoint labels; an edge whose endpoints fall outside these violates
+# the contract. `derivable` marks edges the ingestion may synthesise from richer
+# chains (see traversal_patterns / pipeline/compat_projection.py).
+# -----------------------------------------------------------------------------
+relationship_types:
+  - name: HAS_THRESHOLD
+    from: [Biomarker]
+    to: [Threshold]
+  - name: HAS_REFERENCE_RANGE
+    from: [Biomarker]
+    to: [ReferenceRange]
+  - name: HAS_STATE
+    from: [Biomarker]
+    to: [BiomarkerState]
+  - name: DEFINED_BY
+    from: [BiomarkerState]
+    to: [Threshold, ReferenceRange]
+  - name: INDICATES
+    from: [BiomarkerState, Threshold, Finding, Morphology, Biomarker]
+    to: [Finding, Disease]
+  - name: ASSOCIATED_WITH
+    from: [Disease, Biomarker, Recommendation]
+    to: [Finding, Biomarker, Disease]
+  - name: CAUSED_BY
+    from: [Disease, Finding, BiomarkerState, Artifact, Morphology]
+    to: [Cause]
+  - name: CONFOUNDED_BY
+    from: [Biomarker, BiomarkerState]
+    to: [Artifact]
+  - name: APPLIES_TO
+    from: [Threshold, ReferenceRange, Recommendation]
+    to: [Population]
+  - name: REQUIRES_TEST
+    from: [Finding, Disease]
+    to: [FollowUpTest]
+  - name: CONTRADICTS
+    from: [Disease]
+    to: [Disease]
+  - name: SUPPORTED_BY
+    from:
+      [
+        Biomarker,
+        BiomarkerState,
+        Finding,
+        Morphology,
+        Disease,
+        Cause,
+        Artifact,
+        Threshold,
+        ReferenceRange,
+        Population,
+        Recommendation,
+        FollowUpTest,
+      ]
+    to: [Guideline, Evidence]
+
+# -----------------------------------------------------------------------------
+# Required TRAVERSAL PATTERNS — the single-hop queries the reasoning engine
+# performs. Ingestion must guarantee at least one instance of each (deriving
+# compatibility edges where the raw ontology only has multi-hop chains). A
+# pattern is satisfied if ANY (source_label, rel, target_label) combination
+# exists. `optional: true` downgrades absence to a warning.
+# -----------------------------------------------------------------------------
+traversal_patterns:
+  - id: biomarker_threshold
+    from: [Biomarker]
+    rels: [HAS_THRESHOLD]
+    to: [Threshold]
+  - id: threshold_indicates
+    from: [Threshold]
+    rels: [INDICATES]
+    to: [Disease, Finding]
+  - id: biomarker_indicates
+    from: [Biomarker]
+    rels: [INDICATES]
+    to: [Disease, Finding]
+  - id: biomarker_associated
+    from: [Biomarker]
+    rels: [ASSOCIATED_WITH]
+    to: [Disease]
+  - id: recommendation_outcome
+    from: [Recommendation]
+    rels: [INDICATES, ASSOCIATED_WITH]
+    to: [Disease, Finding]
+  - id: outcome_followup
+    from: [Disease, Finding]
+    rels: [REQUIRES_TEST]
+    to: [FollowUpTest]
+  - id: disease_contradiction
+    from: [Disease]
+    rels: [CONTRADICTS]
+    to: [Disease]
+    optional: true
+
+# -----------------------------------------------------------------------------
+# Neo4j schema objects. Rendered to Cypher identically by the bolt loader and
+# the import.cypher generator (pipeline/contract.py::constraint_cypher/index_cypher).
+# -----------------------------------------------------------------------------
+constraints:
+  - name: entity_id
+    label: Entity
+    property: id
+    type: unique
+
+indexes:
+  - name: entity_name
+    label: Entity
+    property: name
+  - name: biomarker_loinc
+    label: Biomarker
+    property: loinc_code
+
+# -----------------------------------------------------------------------------
+# Validation knobs (soft thresholds used by pipeline/contract_validator.py).
+# -----------------------------------------------------------------------------
+validation:
+  min_loinc_coverage: 0.5 # fraction of Biomarker nodes that should carry loinc_code

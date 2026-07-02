@@ -1,25 +1,12 @@
-# ── ENERVERA CBC — Render deployment (two microservices) ──
-# Backend pipeline (Layers 2→6) + a separate OCR service (Layer 1, PaddleOCR).
-# The backend reaches the OCR service over HTTP via OCR_SERVICE_URL.
+# ── ENERVERA CBC — Render deployment (single service) ──
+# One backend runs all six layers. Layer 1 is the OCR.space REST API and the
+# database is Supabase PostgreSQL, so there is no separate OCR microservice.
 #
-# Set secret values (NEO4J_PASSWORD, GEMINI_API_KEY, DATABASE_URL, …) in the
-# Render dashboard — they are intentionally not committed here.
+# Set secret values (DATABASE_URL, OCR_SPACE_API_KEY, NEO4J_*, GEMINI_API_KEY) in
+# the Render dashboard — they are intentionally not committed here.
 
 services:
-  # ── OCR microservice (Layer 1) ──────────────────────────────────────────────
-  - type: web
-    name: enervera-ocr
-    runtime: python
-    rootDir: ocr
-    plan: standard            # PaddleOCR is memory-heavy; bump if the build OOMs
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /health
-    envVars:
-      - key: PYTHON_VERSION
-        value: "3.11"
-
-  # ── Backend pipeline (Layers 2→6) ───────────────────────────────────────────
+  # ── Backend pipeline (Layers 1→6) ───────────────────────────────────────────
   - type: web
     name: enervera-backend
     runtime: python
@@ -31,25 +18,27 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
-      # Point the backend at the OCR service's public URL. Set this in the
-      # dashboard after the OCR service deploys, e.g.
-      #   https://enervera-ocr.onrender.com
-      - key: OCR_SERVICE_URL
-        sync: false
-      # Secrets — set these in the Render dashboard (sync:false keeps them off git).
+      # ── Secrets — set these in the Render dashboard (sync:false keeps them off git).
+      # Supabase connection string (async/sync drivers derived from it).
       - key: DATABASE_URL
         sync: false
-      - key: ALEMBIC_DATABASE_URL
+      # OCR.space (Layer 1).
+      - key: OCR_SPACE_API_KEY
         sync: false
+      - key: OCR_SPACE_ENDPOINT
+        value: https://api.ocr.space/parse/image
+      # Neo4j Aura (Layer 4).
       - key: NEO4J_URI
         sync: false
-      - key: NEO4J_USER
+      - key: NEO4J_USERNAME
         sync: false
       - key: NEO4J_PASSWORD
         sync: false
+      # Gemini (Layer 6).
       - key: GEMINI_API_KEY
         sync: false
-      - key: APP_ENV
+      # Application.
+      - key: ENVIRONMENT
         value: production
       - key: LOG_LEVEL
         value: INFO

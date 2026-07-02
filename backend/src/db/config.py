@@ -1,9 +1,12 @@
 """
 Application settings, loaded from the project-root ``.env`` (``CBC/.env``).
 
-Two database URLs are used (see the .env):
-  - ``DATABASE_URL``         async URL for the app   (e.g. postgresql+asyncpg://…)
-  - ``ALEMBIC_DATABASE_URL`` sync URL for migrations & seeds (e.g. postgresql+psycopg2://…)
+Database (Supabase PostgreSQL):
+  - ``DATABASE_URL``         the connection string for the whole app. The async
+                             (asyncpg) and sync (psycopg2) drivers are derived from
+                             it in ``db.session`` — one URL is enough.
+  - ``ALEMBIC_DATABASE_URL`` optional explicit override for the sync (migrations/
+                             seeds) URL. Leave unset to derive it from DATABASE_URL.
 
 Secrets stay in the environment — nothing here logs or prints the URLs.
 """
@@ -13,6 +16,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # CBC/.env  (this file is backend/src/db/config.py → parents[3] == CBC/)
@@ -22,9 +26,13 @@ _ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 class Settings(BaseSettings):
     """Environment-backed settings."""
 
-    database_url: str = ""           # async driver URL for the running app
-    alembic_database_url: str = ""   # sync driver URL for Alembic / seeding
-    app_env: str = "development"
+    database_url: str = ""           # Supabase connection string (drivers derived in db.session)
+    alembic_database_url: str = ""   # optional explicit sync URL override for Alembic / seeding
+    # Deployment environment: prefer ENVIRONMENT, accept legacy APP_ENV.
+    app_env: str = Field(
+        default="development",
+        validation_alias=AliasChoices("ENVIRONMENT", "APP_ENV"),
+    )
     log_level: str = "INFO"
 
     model_config = SettingsConfigDict(

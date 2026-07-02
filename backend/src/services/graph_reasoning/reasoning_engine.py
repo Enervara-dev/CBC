@@ -41,7 +41,11 @@ from models.graph_schemas import (
 )
 from models.normalization_schemas import NormalizedBiomarker
 from services.graph_reasoning.biomarker_mappings import BiomarkerFactMapping
+from services.graph_reasoning.contract_compat import check_compatibility
+from services.graph_reasoning.graph_contract import GraphContract, load_contract
+from services.graph_reasoning.graph_diagnostics import GraphDiagnostics
 from services.graph_reasoning.neo4j_connection import Neo4jConnection
+from services.graph_reasoning.traversal_builder import TraversalQueryBuilder
 
 _CONFLICT_RECOMMENDATION = {
     "high": "MANUAL_REVIEW",
@@ -50,115 +54,51 @@ _CONFLICT_RECOMMENDATION = {
 }
 _URGENCY_RANK = {"stat": 3, "urgent": 2, "routine": 1}
 _MAX_RECOMMENDATIONS = 12
-_LOW_OPERATORS = "['<','<=','lt','le','below','less']"
-_HIGH_OPERATORS = "['>','>=','gt','ge','above','greater']"
 
 
-# ── Cypher (traverses the existing CBC graph; run via Neo4jConnection.query) ──
-# STEP 1 — diseases/findings indicated by the patient's abnormal biomarkers.
-# $observations = [{code, names[], ids[], value, direction}].
-QUERY_INFER_DISEASES = f"""
-UNWIND $observations AS obs
-// Match a biomarker by LOINC code first (exact, language-agnostic — both sides
-// source LOINC), falling back to name/id for graph nodes that are not LOINC-coded.
-// Total threshold->disease links across EVERY matched node (the graph has synonym
-// nodes, e.g. "Hemoglobin" with thresholds and "haemoglobin concentration"
-// without) — so a threshold-modelled biomarker gates the non-directional direct
-// edges of all its synonyms.
-CALL (obs) {{
-    MATCH (b:Biomarker)
-    WHERE (obs.loinc <> '' AND b.loinc_code = obs.loinc)
-       OR toLower(b.name) IN obs.names OR toLower(b.id) IN obs.ids
-    OPTIONAL MATCH (b)-[:HAS_THRESHOLD]->(:Threshold)-[:INDICATES]->(dd:Disease)
-    RETURN count(dd) AS n_thresh
-}}
-MATCH (b:Biomarker)
-WHERE (obs.loinc <> '' AND b.loinc_code = obs.loinc)
-   OR toLower(b.name) IN obs.names OR toLower(b.id) IN obs.ids
-CALL (obs, b, n_thresh) {{
-    // (A) threshold-modeled biomarkers (e.g. HGB): direction + operator + numeric
-    //     value gate (unit-converted g/dL<->g/L) so only the right severity fires.
-    MATCH (b)-[:HAS_THRESHOLD]->(t:Threshold)-[:INDICATES]->(d)
-    WHERE (d:Disease OR d:Finding) AND toFloat(t.value) IS NOT NULL
-    WITH obs, d, t,
-         toFloat(t.value) AS thresh,
-         toLower(coalesce(t.operator, '')) AS op,
-         toLower(trim(coalesce(t.unit, '')))   AS tu,
-         toLower(trim(coalesce(obs.unit, ''))) AS pu,
-         obs.value AS raw_pval
-    // Reconcile units before the numeric compare. Layer 2 emits the biomarker's
-    // standard unit (e.g. HGB g/dL), graph thresholds are g/L → convert g/dL↔g/L.
-    WITH obs, d, t, thresh, op,
-         CASE
-           WHEN tu = 'g/l'  AND pu = 'g/dl' THEN raw_pval * 10.0
-           WHEN tu = 'g/dl' AND pu = 'g/l'  THEN raw_pval / 10.0
-           ELSE raw_pval
-         END AS pval
-    WHERE (obs.direction = 'low'  AND op IN {_LOW_OPERATORS}  AND pval < thresh)
-       OR (obs.direction = 'high' AND op IN {_HIGH_OPERATORS} AND pval > thresh)
-    RETURN d AS d, t AS t
-    UNION
-    // (B) non-threshold biomarkers (MCV, MCH, MCHC, RDW, HCT, PLT …): direct
-    //     diagnostic edge. Gated to n_thresh = 0 so HGB doesn't fire non-directional
-    //     direct edges (it uses its thresholds in branch A instead).
-    MATCH (b)-[:INDICATES]->(d)
-    WHERE (d:Disease OR d:Finding) AND n_thresh = 0
-    RETURN d AS d, null AS t
-    UNION
-    // (C) disease-level associations for non-threshold biomarkers.
-    MATCH (b)-[:ASSOCIATED_WITH]->(d:Disease)
-    WHERE n_thresh = 0
-    RETURN d AS d, null AS t
-}}
-WITH obs, b, d, t
-RETURN DISTINCT
-    d.id   AS finding_id,
-    d.name AS finding_name,
-    (CASE WHEN d:Disease THEN 'Disease' WHEN d:Finding THEN 'Finding' ELSE head(labels(d)) END) AS kind,
-    obs.code  AS biomarker,
-    b.name    AS biomarker_name,
-    obs.value AS patient_value,
-    obs.direction AS direction,
-    toFloat(t.value) AS threshold_value,
-    t.unit AS threshold_unit,
-    toLower(coalesce(t.operator, '')) AS operator
-"""
-
-# STEP 3 — recommendations + follow-up tests for the inferred diseases/findings.
-QUERY_INFER_RECOMMENDATIONS = """
-MATCH (d) WHERE d.id IN $target_ids AND (d:Disease OR d:Finding)
-CALL (d) {
-    MATCH (d)<-[:INDICATES|ASSOCIATED_WITH]-(r:Recommendation)
-    RETURN r.id AS rid, r.name AS rname, 'ACTION' AS rtype
-    UNION
-    MATCH (d)-[:REQUIRES_TEST]->(ft:FollowUpTest)
-    RETURN ft.id AS rid, ft.name AS rname, 'TEST' AS rtype
-}
-RETURN DISTINCT d.id AS target_id, rid AS recommendation_id,
-       rname AS recommendation_name, rtype AS recommendation_type
-"""
-
-# STEP 4 — clinically-contradictory diseases (only if such edges exist).
-QUERY_DETECT_CONFLICTS = """
-MATCH (d1)-[c:CONTRADICTS|CONFLICTS_WITH|MUTUALLY_EXCLUSIVE_WITH]-(d2)
-WHERE d1.id IN $target_ids AND d2.id IN $target_ids AND d1.id < d2.id
-  AND (d1:Disease OR d1:Finding) AND (d2:Disease OR d2:Finding)
-RETURN d1.id AS disease1_id, d1.name AS disease1_name,
-       d2.id AS disease2_id, d2.name AS disease2_name,
-       type(c) AS conflict_type,
-       coalesce(c.severity, 'medium') AS severity,
-       coalesce(c.reason, c.note, d1.name + ' contradicts ' + d2.name) AS conflict_reason
-"""
+# ── Cypher is now generated from the Graph Contract (see traversal_builder.py). ──
+# The reasoning engine no longer hard-codes labels, relationship types, traversal
+# patterns, or property names — they are all derived from graph_contract.yaml.
 
 
 class GraphReasoningEngine:
-    """Infers diseases/findings by traversing the Neo4j CBC knowledge graph."""
+    """Infers diseases/findings by traversing the Neo4j knowledge graph.
 
-    def __init__(self, neo4j_connection: Neo4jConnection, logger: Optional[logging.Logger] = None) -> None:
+    Traversal behaviour is **contract-driven**: at construction the engine loads
+    the Graph Contract, fails fast if it is incompatible, and generates its Cypher
+    from the contract's ``traversal_patterns``. The clinical reasoning algorithms
+    (observation building, confidence, dedup, evidence, conflicts) are unchanged.
+    """
+
+    def __init__(
+        self,
+        neo4j_connection: Neo4jConnection,
+        logger: Optional[logging.Logger] = None,
+        contract: Optional[GraphContract] = None,
+        query_builder: Optional[TraversalQueryBuilder] = None,
+    ) -> None:
         self.neo4j = neo4j_connection
         self.logger = logger or logging.getLogger(__name__)
         self.mapping = BiomarkerFactMapping()
         self.metrics: Dict[str, int] = {"nodes_queried": 0}
+
+        # ── Contract loading + fail-fast compatibility check (requirements 1/3) ──
+        self.contract = contract or load_contract()
+        self.contract_warnings = check_compatibility(self.contract)
+        for w in self.contract_warnings:
+            self.logger.warning("Graph Contract warning: %s", w)
+
+        # ── Traversal generation from the contract (requirement 2) ──────────────
+        self.builder = query_builder or TraversalQueryBuilder(self.contract)
+        self._q_diseases = self.builder.infer_diseases()
+        self._q_recommendations = self.builder.infer_recommendations()
+        self._q_conflicts = self.builder.detect_conflicts()  # None if pattern absent
+
+        self.diagnostics = GraphDiagnostics(neo4j_connection, self.contract, self.builder)
+        self.logger.info(
+            "Layer 4 engine initialised against Graph Contract v%s (%s).",
+            self.contract.version, self.contract.source_path,
+        )
 
     # ── Main orchestration ───────────────────────────────────────────────────
     async def reason(self, layer3_output: Layer3Output) -> Layer4Output:
@@ -180,7 +120,7 @@ class GraphReasoningEngine:
         unique: Dict[str, Dict[str, Any]] = {}
         try:
             if observations:
-                rows = await self.neo4j.query(QUERY_INFER_DISEASES, {"observations": observations})
+                rows = await self.neo4j.query(self._q_diseases, {"observations": observations})
                 self.metrics["nodes_queried"] += len(rows)
                 unique = self._aggregate_findings(rows)
                 queries_executed.append("infer_diseases")
@@ -197,7 +137,7 @@ class GraphReasoningEngine:
         try:
             if target_ids:
                 rec_rows = await self.neo4j.query(
-                    QUERY_INFER_RECOMMENDATIONS, {"target_ids": target_ids}
+                    self._q_recommendations, {"target_ids": target_ids}
                 )
                 self.metrics["nodes_queried"] += len(rec_rows)
                 recommendations = self._build_recommendations(rec_rows)
@@ -207,12 +147,13 @@ class GraphReasoningEngine:
             self.logger.error("STEP 3 (recommendations) failed: %s", exc)
             errors.append(f"recommendations: {exc}")
 
-        # STEP 4 — detect conflicts among inferred targets
+        # STEP 4 — detect conflicts among inferred targets (only if the contract
+        # declares the disease_contradiction traversal; otherwise skip cleanly).
         conflicts: List[ConflictAlert] = []
         try:
-            if len(target_ids) > 1:
+            if self._q_conflicts is not None and len(target_ids) > 1:
                 conflict_rows = await self.neo4j.query(
-                    QUERY_DETECT_CONFLICTS, {"target_ids": target_ids}
+                    self._q_conflicts, {"target_ids": target_ids}
                 )
                 self.metrics["nodes_queried"] += len(conflict_rows)
                 conflicts = self._build_conflicts(conflict_rows)
@@ -221,6 +162,19 @@ class GraphReasoningEngine:
         except Exception as exc:
             self.logger.error("STEP 4 (detect conflicts) failed: %s", exc)
             errors.append(f"detect_conflicts: {exc}")
+
+        # STEP 4b — diagnostics: if STEP 1 ran cleanly but produced nothing, explain
+        # why (empty graph / contract violation / missing traversal / unmatched
+        # biomarkers / genuine absence) instead of returning a silent empty result.
+        diagnostics: List[str] = []
+        step1_failed = any(e.startswith("infer_diseases") for e in errors)
+        if not validated_findings and not step1_failed:
+            try:
+                diagnostics = await self.diagnostics.diagnose(observations)
+                for d in diagnostics:
+                    self.logger.info("Layer 4 diagnostic — %s", d)
+            except Exception as exc:  # noqa: BLE001 — diagnostics never break reasoning
+                self.logger.warning("Diagnostics failed: %s", exc)
 
         # STEP 5 — audit trail
         execution_time_ms = round((time.perf_counter() - run_start) * 1000.0, 3)
@@ -251,6 +205,7 @@ class GraphReasoningEngine:
             audit_trail=audit_trail,
             status=status,
             error_messages=errors,
+            diagnostics=diagnostics,
         )
 
     # ── Inputs ───────────────────────────────────────────────────────────────

@@ -134,7 +134,13 @@ class ConfidenceCalibrator:
 
         ec_factor = self.calibration["evidence_count_factor"].get(ec_key, 1.0)
         cons_factor = self.calibration["consistency_factor"].get(consistency, 1.0)
-        sev_factor = self.calibration.get("hemoglobin_severity_factor", {}).get(severity, 1.0)
+        # Accept the legacy "hemoglobin_severity_factor" key as a fallback so an
+        # un-migrated rule bundle keeps calibrating instead of silently using 1.0.
+        sev_table = (
+            self.calibration.get("severity_factor")
+            or self.calibration.get("hemoglobin_severity_factor", {})
+        )
+        sev_factor = sev_table.get(severity, 1.0)
 
         final = max(0.0, min(1.0, round(original_confidence * ec_factor * cons_factor * sev_factor, 4)))
         return {

@@ -1,7 +1,7 @@
 """
 End-to-end CBC report analysis from a PDF/image file (all six layers).
 
-    file → Layer 1 (PaddleOCR/pdfplumber) → adapter → L2 normalize → L3 features
+    file → Layer 1 (OCR.space API) → adapter → L2 normalize → L3 features
          → L4 graph reasoning (Neo4j) → L5 validation → clinician-ready findings
          → Layer 6 (Gemini) patient + clinician reports + deterministic exports
 
@@ -15,9 +15,9 @@ Usage
 
 Prerequisites (in the environment you run this from)
 ----------------------------------------------------
-  - PaddleOCR + pdfplumber installed (Layer 1; same venv, no torch).
-  - PostgreSQL reachable + seeded (Layer 2 reference ranges) — DATABASE_URL in CBC/.env.
-  - Neo4j reachable (Layer 4) — NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD in CBC/.env.
+  - OCR_SPACE_API_KEY in CBC/.env (Layer 1 — OCR.space API; no local OCR install).
+  - Supabase PostgreSQL reachable + seeded (Layer 2 reference ranges) — DATABASE_URL in CBC/.env.
+  - Neo4j reachable (Layer 4) — NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD in CBC/.env.
   - GEMINI_API_KEY in CBC/.env + `pip install google-genai` (Layer 6 reports).
     Any layer that is unavailable degrades gracefully (status partial/error; the
     deterministic exports are always produced even if the LLM reports fail).
@@ -31,15 +31,13 @@ import os
 import sys
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
-# Layer 1 lives in ocr/ (PaddleOCRExtractor lazily imports core.* / preprocessing.*);
-# Layers 2–5 live in backend/src. Put both on the path.
-sys.path.insert(0, os.path.join(_ROOT, "ocr"))
+# All layers now live in backend/src (Layer 1 is the OCR.space HTTP client).
 sys.path.insert(0, os.path.join(_ROOT, "backend", "src"))
 
 
 async def analyze(args: argparse.Namespace) -> int:
     # Layer 1
-    from paddle_ocr_extractor import PaddleOCRExtractor
+    from orchestration.ocr_space_client import OCRSpaceClient
     # Layers 2–5 + orchestration
     from orchestration.cbc_file_analyzer import CBCFileAnalyzer
     from db.session import get_async_sessionmaker
@@ -82,7 +80,7 @@ async def analyze(args: argparse.Namespace) -> int:
     validator = ConfidenceValidationEngine(ConfidenceCalibrator(rules), rules)
 
     analyzer = CBCFileAnalyzer(
-        ocr_extractor=PaddleOCRExtractor(),
+        ocr_extractor=OCRSpaceClient(),
         layer2_normalizer=normalizer,
         layer3_feature_generator=feature_gen,
         layer4_graph_reasoner=graph_reasoner,
@@ -167,39 +165,21 @@ async def analyze(args: argparse.Namespace) -> int:
 
 
 async def _show_ocr(file_path: str) -> int:
-    """Diagnostic: raw OCR detections + clustered rows + name→code resolution."""
-    from paddle_ocr_extractor import PaddleOCRExtractor
+    """Diagnostic: OCR.space parsed rows + name→code resolution."""
+    from orchestration.ocr_space_client import OCRSpaceClient, OCRSpaceError
     from orchestration.layer1_adapter import _resolve_biomarker_code
 
-    ex = PaddleOCRExtractor()
+    client = OCRSpaceClient()
     try:
-        raw = await asyncio.to_thread(ex._run_ocr, file_path)
-    except Exception as exc:  # noqa: BLE001
+        rows = await client.extract_biomarkers_from_file(file_path)
+    except (OCRSpaceError, FileNotFoundError) as exc:
         print(f"OCR extraction failed: {exc}")
         return 1
 
-    def yc(it: dict) -> float:
-        b = it.get("bbox") or [0, 0, 0, 0]
-        return (b[1] + b[3]) / 2.0
-
-    # 1) raw detections — shows whether each label/value was detected, and at what y
-    raw_sorted = sorted(raw, key=lambda it: (yc(it), (it.get("bbox") or [0])[0]))
-    print(f"\nRAW OCR — {len(raw)} text detections (text | x , y | conf):")
-    print("-" * 78)
-    for it in raw_sorted:
-        b = it.get("bbox") or [0, 0, 0, 0]
-        print(f"  {str(it.get('text',''))[:40]:40} | x{int(b[0]):>4},y{int(yc(it)):>4} "
-              f"| {float(it.get('confidence', 0) or 0):.2f}")
-
-    # 2) clustered rows → parsed biomarkers → resolution
-    rows = ex._extract_table_from_ocr_output(raw)
-    print(f"\nCLUSTERED ROWS → biomarkers ({len(rows)} rows)  —  name | value | unit  →  code")
+    print(f"\nOCR.space PARSED ROWS ({len(rows)})  —  name | value | unit  →  code")
     print("-" * 78)
     resolved = set()
-    for rd in rows:
-        parsed = ex._parse_biomarker_row(rd)
-        if not parsed:
-            continue
+    for parsed in rows:
         name = str(parsed.get("name", ""))
         code = _resolve_biomarker_code(name)
         if code:
@@ -211,8 +191,8 @@ async def _show_ocr(file_path: str) -> int:
     print("-" * 78)
     print("resolved codes  :", sorted(resolved) or "(none)")
     print("required missing:", sorted(required - resolved) or "none")
-    print("\nIf a biomarker is detected in RAW OCR but absent from CLUSTERED ROWS, it's a "
-          "row-pairing issue; if it's absent from RAW OCR too, it's an OCR/contrast issue.")
+    print("\nIf a biomarker is missing here, it was either not read by OCR (image/contrast) "
+          "or its line did not parse as 'name value unit'.")
     return 0
 
 

@@ -27,7 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from orchestration.cbc_orchestrator import CBCAnalysisResult, CBCOrchestrator
 from orchestration.layer1_adapter import Layer1ToLayer2Adapter
-from orchestration.remote_ocr_client import RemoteOCRError, RemoteOCRExtractor
+from orchestration.ocr_space_client import OCRSpaceClient, OCRSpaceError
+from services.presentation.report_generator import ReportGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,11 @@ class AnalyzeCBCRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(
         None, description='Optional context, e.g. {"lab_date": "2024-01-15"}.'
     )
+    include_reports: bool = Field(
+        False,
+        description="If true, also generate Layer 6 patient/clinician reports + "
+                    "exports (requires GEMINI_API_KEY; adds LLM latency).",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -77,6 +83,14 @@ class AnalyzeCBCResponse(BaseModel):
     status: str = Field(..., description='"success", "partial", or "error".')
     final_findings: List[Dict[str, Any]] = Field(default_factory=list)
     clinical_flags: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
+    recommendations: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Layer 4 recommendations (actions + follow-up tests)."
+    )
+    reports: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Layer 6 report bundle (patient/clinician reports + JSON/HL7/CSV/PDF "
+                    "exports). Present only when include_reports=true was requested.",
+    )
     audit_trail: Dict[str, Any] = Field(default_factory=dict)
     error_messages: List[str] = Field(default_factory=list)
     execution_time_ms: float = 0.0
@@ -93,6 +107,7 @@ class AnalyzeCBCResponse(BaseModel):
 _orchestrator: Optional[CBCOrchestrator] = None
 _sessionmaker: Optional[async_sessionmaker[AsyncSession]] = None
 _normalizer_factory: Optional[Callable[[AsyncSession], Any]] = None
+_report_generator: Optional[ReportGenerator] = None
 
 
 def init_orchestrator(orchestrator: CBCOrchestrator) -> None:
@@ -100,6 +115,13 @@ def init_orchestrator(orchestrator: CBCOrchestrator) -> None:
     global _orchestrator
     _orchestrator = orchestrator
     logger.info("Orchestrator registered with API routes.")
+
+
+def init_report_generator(generator: Optional[ReportGenerator]) -> None:
+    """Register the Layer-6 report generator (or ``None`` if unavailable)."""
+    global _report_generator
+    _report_generator = generator
+    logger.info("Report generator registered with API routes (available=%s).", generator is not None)
 
 
 def init_db(sessionmaker: async_sessionmaker[AsyncSession]) -> None:
@@ -129,6 +151,38 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         raise HTTPException(status_code=503, detail="Database not initialized.")
     async with _sessionmaker() as session:
         yield session
+
+
+async def _build_reports(
+    result: CBCAnalysisResult, include_reports: bool
+) -> Optional[Dict[str, Any]]:
+    """
+    Layer 6: build the report bundle for ``result`` when requested.
+
+    Returns ``None`` when reports were not requested. Otherwise always returns a
+    dict — a small status object when Layer 6 is unavailable or there is nothing
+    to report — so failures never break the analysis response.
+    """
+    if not include_reports:
+        return None
+    if _report_generator is None:
+        return {"status": "unavailable",
+                "warnings": ["Layer 6 not configured (set GEMINI_API_KEY to enable reports)."]}
+    if not result.final_findings:
+        return {"status": "skipped", "warnings": ["No findings to report."]}
+    try:
+        bundle = await _report_generator.generate(
+            final_findings=result.final_findings,
+            clinical_flags=result.clinical_flags,
+            recommendations=result.recommendations,
+            audit_trail=result.audit_trail.layer5_validation,
+            patient_id=result.patient_id,
+            timestamp=result.timestamp,
+        )
+        return bundle.model_dump()
+    except Exception as exc:  # noqa: BLE001 — never fail the analysis over report gen
+        logger.exception("Layer 6 report generation failed for patient=%s", result.patient_id)
+        return {"status": "error", "warnings": [f"report_generation_failed: {exc}"]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,7 +252,8 @@ async def analyze_cbc(
         flag_count, result.execution_time_ms,
     )
 
-    # STEP 5 — serialize (reuse the result's tested serializer for nested models)
+    # STEP 5 — Layer 6 reports (opt-in) + serialize
+    reports = await _build_reports(result, request.include_reports)
     serialized = result.to_dict()
     return AnalyzeCBCResponse(
         patient_id=result.patient_id,
@@ -206,6 +261,8 @@ async def analyze_cbc(
         status=result.status,
         final_findings=serialized["final_findings"],
         clinical_flags=serialized["clinical_flags"],
+        recommendations=serialized["recommendations"],
+        reports=reports,
         audit_trail=serialized["audit_trail"],
         error_messages=result.error_messages,
         execution_time_ms=result.execution_time_ms,
@@ -221,18 +278,19 @@ async def analyze_file(
     patient_id: str = Form(...),
     gender: Optional[str] = Form(None),
     age_years: Optional[int] = Form(None),
+    include_reports: bool = Form(False),
     db: AsyncSession = Depends(get_db),
     orchestrator: CBCOrchestrator = Depends(get_orchestrator),
 ) -> AnalyzeCBCResponse:
     """
-    End-to-end analysis from a report file (the two-microservice flow).
+    End-to-end analysis from a report file.
 
-    The file is sent to the OCR microservice (``OCR_SERVICE_URL``) for extraction;
-    the returned rows are mapped to canonical biomarker codes (Layer 1→2 adapter)
-    and run through the same orchestrator as ``/analyze``.
+    The file is sent to the OCR.space API (Layer 1) for text extraction; the
+    parsed rows are mapped to canonical biomarker codes (Layer 1→2 adapter) and
+    run through the same orchestrator as ``/analyze``.
 
     HTTP semantics mirror ``/analyze``; additionally returns 502 if the OCR
-    microservice is unreachable and 422 if no biomarkers can be extracted.
+    service is unreachable/errors and 422 if no biomarkers can be extracted.
     """
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in _SUPPORTED_UPLOAD_EXT:
@@ -249,11 +307,11 @@ async def analyze_file(
         tmp_path = tmp.name
 
     try:
-        # STEP 2 — Layer 1: OCR via the microservice
+        # STEP 2 — Layer 1: OCR via the OCR.space API
         try:
-            rows = await RemoteOCRExtractor().extract_biomarkers_from_file(tmp_path)
-        except RemoteOCRError as exc:
-            logger.error("OCR microservice error for patient=%s: %s", patient_id, exc)
+            rows = await OCRSpaceClient().extract_biomarkers_from_file(tmp_path)
+        except OCRSpaceError as exc:
+            logger.error("OCR.space error for patient=%s: %s", patient_id, exc)
             raise HTTPException(status_code=502, detail=f"OCR service error: {exc}") from exc
 
         # STEP 3 — adapt OCR rows → canonical biomarker dict
@@ -286,6 +344,7 @@ async def analyze_file(
     finally:
         os.unlink(tmp_path)
 
+    reports = await _build_reports(result, include_reports)
     serialized = result.to_dict()
     return AnalyzeCBCResponse(
         patient_id=result.patient_id,
@@ -293,6 +352,8 @@ async def analyze_file(
         status=result.status,
         final_findings=serialized["final_findings"],
         clinical_flags=serialized["clinical_flags"],
+        recommendations=serialized["recommendations"],
+        reports=reports,
         audit_trail=serialized["audit_trail"],
         error_messages=result.error_messages,
         execution_time_ms=result.execution_time_ms,

@@ -15,7 +15,7 @@ only layer that uses an LLM, and strictly as a presentation step.
 
 | Layer                         | Responsibility                                                                                                                                | Lives in                                      | Backing store                    |
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- | -------------------------------- |
-| **1 — Extraction**            | PDF/image → raw biomarker rows                                                                                                                | `ocr/`                                        | — (PaddleOCR models)             |
+| **1 — Extraction**            | PDF/image → raw biomarker rows                                                                                                                | `backend/src/orchestration/ocr_space_client.py` | OCR.space API                    |
 | **2 — Normalization**         | raw rows → canonical, unit-standard, reference-anchored, **LOINC-coded** values                                                               | `backend/src/services/normalization/`         | PostgreSQL                       |
 | **3 — Feature Generation**    | values → clinical **facts** (binary / severity / ratio) — no disease inference                                                                | `backend/src/services/feature_generation/`    | in-code definitions              |
 | **4 — Graph Reasoning**       | **facts + values → inferred diseases**, evidence, conflicts, recommendations (traverses the existing `Biomarker → Threshold → Disease` graph) | `backend/src/services/graph_reasoning/`       | Neo4j (clinical knowledge graph) |
@@ -26,9 +26,9 @@ All **per-panel knowledge** (codes, LOINC, aliases, features, validation rules,
 reference ranges) is consolidated in `backend/src/domains/<panel>/` (§3a) so a new
 specialty is a folder copy, not a pipeline edit.
 
-**Tech stack:** Python 3.11 · PaddleOCR / pdfplumber / PyMuPDF (L1) ·
-PostgreSQL + SQLAlchemy 2 + Alembic (L2) · Neo4j 5 (L4) · Pydantic v2 (contracts)
-· Google Gemini API (L6) · FastAPI (API) · pytest / pytest-asyncio (tests).
+**Tech stack:** Python 3.11 · OCR.space REST API (L1) · Supabase PostgreSQL +
+SQLAlchemy 2 + Alembic (L2) · Neo4j 5 / Aura (L4) · Pydantic v2 (contracts) ·
+Google Gemini API (L6) · FastAPI (API) · pytest / pytest-asyncio (tests).
 
 ---
 
@@ -37,8 +37,8 @@ PostgreSQL + SQLAlchemy 2 + Alembic (L2) · Neo4j 5 (L4) · Pydantic v2 (contrac
 ```
 PDF / image
    │
-   ▼  Layer 1 — Extraction (OCR-first)
-   │   PaddleOCR (scanned/image) · pdfplumber (digital PDF text layer)
+   ▼  Layer 1 — Extraction (OCR.space API)
+   │   OCRSpaceClient: POST PDF/image → OCR.space → parse text into rows
    ▼
 raw biomarkers:  [{ name, value, unit, confidence }]
    │
@@ -71,39 +71,37 @@ ReportBundle  { patient_report, clinician_report, exports{json,hl7_v2,csv,pdf_me
                 final_findings (unmodified), warnings, status }
 ```
 
-This flow is driven by the orchestrators (§3): **`CBCFileAnalyzer`** runs the whole
-chain from a file (OCR → adapter → L2→L5); **`CBCOrchestrator`** runs L2→L5 from a
+This flow is driven by the orchestrators (§3): **`CBCFileAnalyzer`** runs OCR →
+adapter → **L2→L5** from a file; **`CBCOrchestrator`** runs **L2→L5** from a
 `{biomarker_code: value}` dict. The result is a `CBCAnalysisResult` with a nested
-per-layer audit trail.
+per-layer audit trail. **Layer 6 is an optional step:** the API generates it
+on request (`include_reports=true` on `/api/analyze` + `/api/analyze-file`), and
+the `analyze_report.py` CLI always calls `ReportGenerator` on the L5 output.
+Neither orchestrator runs Layer 6 itself — the API/CLI drives it after L5.
 
 ---
 
 ## 3. Main components and responsibilities
 
-### Layer 1 — Extraction (`ocr/`)
+### Layer 1 — Extraction (`backend/src/orchestration/ocr_space_client.py`)
 
-What the backend pipeline (`CBCFileAnalyzer`) actually uses from `ocr/`:
+OCR is the **OCR.space REST API** — no local OCR engine, no separate microservice.
 
-- `core/stage1_pdf_detector.py` — detect digital-vs-scanned + render pages to images.
-- `preprocessing/ocr_engine.py` — PaddleOCR text detection (lazy singleton;
-  `truststore`-enabled for the corporate proxy); for digital PDFs pdfplumber reads
-  the text layer (`core/stage2_extractor.py`).
-- `paddle_ocr_extractor.py` — **PaddleOCRExtractor**: the bridge `CBCFileAnalyzer`
-  consumes. `extract_biomarkers_from_file()` renders + OCRs, groups detected text
-  into rows (by y), parses each row → `[{name, value, unit, confidence}]`. PaddleOCR
-  is imported lazily, so importing this module does not require PaddleOCR installed.
+- `ocr_space_client.py` — **OCRSpaceClient**: the bridge `CBCFileAnalyzer` (and
+  `POST /api/analyze-file`) consume. `extract_biomarkers_from_file(file_path)` POSTs
+  the PDF/image to OCR.space (`OCR_SPACE_ENDPOINT`, `OCR_SPACE_API_KEY`,
+  `isTable=true`, `OCREngine=2`), validates the JSON (`IsErroredOnProcessing` /
+  `OCRExitCode` / `ParsedResults`), then parses the returned text line-by-line into
+  `[{name, value, unit, confidence}]` — exactly the row schema Layer 2 expects via
+  the `Layer1ToLayer2Adapter`. Per-token confidence is not provided by OCR.space, so
+  rows carry a fixed nominal confidence (`DEFAULT_ROW_CONFIDENCE`).
+- **Robustness:** per-call timeout, bounded retries with exponential backoff on
+  network / 5xx / transient errors, fail-fast on 4xx, and `OCRSpaceError` on any
+  unrecoverable failure (mapped to HTTP 502 by the route).
 
-`ocr/api/main.py` is the **OCR microservice** (deployed separately — see §8). Its
-**`POST /extract`** runs `PaddleOCRExtractor` and returns the rows; this is what the
-backend's `RemoteOCRExtractor` calls in the two-service deployment. (Its older
-`POST /analyze` endpoint drives the legacy standalone OCR app below and is not on
-the Layers 2–5 path.)
-
-Not used by the backend pipeline (a **separate, self-contained OCR application**,
-kept in the repo): `core/stage3_parser`…`stage7_summary` (config-driven parse →
-flag → rule-based condition scoring → template summary), `core/pipeline.py`, the
-legacy `/analyze` endpoint, and `run_extraction_test.py`. These were built mainly
-for the LFT panel and are exercised independently of Layers 2–5.
+`OCRSpaceClient` matches the same `extract_biomarkers_from_file` interface the old
+`PaddleOCRExtractor` / `RemoteOCRExtractor` exposed, so Layers 2–6, the adapter,
+and the orchestrator are unchanged.
 
 ### Layer 2 — Normalization (`backend/src/services/normalization/`)
 
@@ -177,7 +175,7 @@ rephrases/explains validated findings and may **not** create, modify, or invent
 findings, diagnoses, confidence values, lab values, recommendations, or guideline
 references.
 
-- `prompts.py` — the verbatim patient/clinician system + user templates, plus a
+- `prompts.py` — the verbatim patient/clinician system + user templates,. plus a
   `GENERAL_SAFETY_PROMPT` appended to every system prompt (so OCR/finding free
   text is treated as **data only**, not instructions).
 - `llm_client.py` — `LLMClient` **Protocol** (provider-agnostic) + `GeminiLLMClient`
@@ -217,11 +215,11 @@ references.
   (`BIOMARKER_LOOKUP`) is sourced from `domains/cbc/biomarkers.py`.
 - `cbc_file_analyzer.py` — **CBCFileAnalyzer** (async): the full file→findings
   pipeline (validate file → OCR → adapter → orchestrator), threading Layer 1 into
-  the audit trail. The injected `ocr_extractor` may be the local `PaddleOCRExtractor`
-  or the `RemoteOCRExtractor` (same interface).
-- `remote_ocr_client.py` — **RemoteOCRExtractor**: drop-in OCR extractor that POSTs
-  the file to the OCR microservice's `POST /extract` (via `OCR_SERVICE_URL`) and
-  returns the rows, so the backend never imports paddle. Used by `/api/analyze-file`.
+  the audit trail. The injected `ocr_extractor` is the `OCRSpaceClient` (any object
+  exposing `extract_biomarkers_from_file` works — handy for tests).
+- `ocr_space_client.py` — **OCRSpaceClient** (Layer 1): calls the OCR.space API and
+  parses the text into `[{name,value,unit,confidence}]` rows. Used by
+  `/api/analyze-file` and the `analyze_report.py` CLI (see §3 Layer 1).
 
 ### API (`backend/src/api/`)
 
@@ -232,9 +230,9 @@ references.
   (orchestrator/DB not initialized), 500 (unexpected); a graceful `status="error"`
   still returns 200 with the audit trail. Plus `GET /api/health`.
   **`POST /api/analyze-file`** (multipart): upload a PDF/image → the file is sent to
-  the OCR microservice (`OCR_SERVICE_URL`), the rows are mapped to canonical codes
+  the OCR.space API (`OCRSpaceClient`), the rows are mapped to canonical codes
   (Layer 1→2 adapter), then run through the same orchestrator; same response shape,
-  plus 502 (OCR service unreachable) and 422 (no biomarkers resolved).
+  plus 502 (OCR service unreachable/errored) and 422 (no biomarkers resolved).
   **DI:** the orchestrator + stateless L3–L5 are app-lifetime singletons; the
   `get_db` dependency yields a **fresh `AsyncSession` per request** (an
   `AsyncSession` is not safe to share concurrently), and a registered normalizer
@@ -384,25 +382,25 @@ environment (missing dependency / service).
 | Area                                                                                                | Status                                                                                                                                                                                                                                                 |
 | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Layer 2 — services (UnitConverter, ReferenceRangeLookup, DataQualityChecker, DataNormalizer)        | ✅ **Tested** — 37 tests (`test_normalization_layer2.py`) against in-memory SQLite. Includes **LOINC normalization** (`domains/cbc/biomarkers.CODE_TO_LOINC` → `NormalizedBiomarker.loinc_code`), verified to tag e.g. HGB `718-7`.                                            |
-| Layer 2 — DB (models, idempotent seeds, Alembic)                                                    | ✅ **Built** — `db/models.py` (`ReferenceRange`), `db/seeds.py`, one Alembic migration (`init_reference_range`). ⏳ **Not run here** — migrate + seed on real PostgreSQL is the operator's step (`alembic upgrade head` + `python -m db.seed_runner`). |
+| Layer 2 — DB (models, idempotent seeds, Alembic)                                                    | ✅ **Live-verified (2026-07-01)** — `alembic upgrade head` + `python -m db.seed_runner` applied to **Supabase**; `reference_range` created and **40 rows** loaded, read back over both the sync (psycopg2) and async (asyncpg) drivers. |
 | Layer 3 — feature generation (facts only)                                                           | ✅ **Tested** — 26 tests (`test_feature_generation_layer3.py`). Binary/severity/ratio; no disease inference.                                                                                                                                           |
-| Layer 4 — graph reasoning (KG traversal, no InferenceRule)                                          | ✅ **Tested** — 15 tests (`test_graph_reasoning_layer4.py`, fake Neo4j). ✅ **Live-verified** against the configured Neo4j (mild/severe/high HGB + multi-marker iron-deficiency returned correct findings + recommendations).                          |
+| Layer 4 — graph reasoning (KG traversal, no InferenceRule)                                          | ✅ **Tested** — 15 tests (`test_graph_reasoning_layer4.py`, fake Neo4j). ⚠️ **Live findings depend on the graph:** the traversal runs against the configured `NEO4J_URI`, but the current **local** Neo4j graph is missing the full CBC schema (no `Threshold.operator` — DBMS warns "property `operator` does not exist"), so a live run returns **0 findings**. Load the full CBC graph (or point at Aura) to get real findings — no code change. |
 | Layer 5 — validation rules + calibrator + engine                                                    | ✅ **Tested** — 8 tests (`test_validation.py`).                                                                                                                                                                                                        |
 | Pydantic contracts (L2–L5)                                                                          | ✅ **Built** — schemas defined and used across the layers (`models/*_schemas.py`).                                                                                                                                                                     |
 | Orchestration — `CBCOrchestrator` (L2→L5) + `CBCFileAnalyzer` (file→findings) + `layer1_adapter.py` | ✅ **Built**; per-layer error isolation. ⏳ No committed orchestration test suite; not run end-to-end against live DB+Neo4j in this env.                                                                                                               |
-| Layer 1 — `PaddleOCRExtractor` + OCR engine (`ocr/`)                                                | ✅ **Built** (PaddleOCR imported lazily). ⏳ **Not run here** — PaddleOCR is not installed in this dev env, so the OCR→rows path was not executed against a real PDF this session.                                                                     |
-| File-analysis CLI — `analyze_report.py`                                                             | ✅ **Built** — runs all six layers (OCR → L2–L5 → Layer 6 reports + exports), flags `--no-reports`/`--model`/`--out-dir`. The **L2→L6 tail is live-verified** (live Neo4j + Gemini). ⏳ The L1 OCR + Postgres front is **not run here** (no PaddleOCR / Postgres in this dev env). |
-| FastAPI endpoints — `POST /api/analyze`, **`POST /api/analyze-file`**, `GET /api/health` (`api/routes.py`, `api/main.py`) | ✅ **Built**; per-request `AsyncSession` DI, lifespan wiring, best-effort DB/Neo4j init. `/api/analyze-file` calls the OCR microservice via `RemoteOCRExtractor`. ⏳ No committed API test suite; the file path is not run end-to-end in this env (no OCR service / PaddleOCR). |
+| Layer 1 — `OCRSpaceClient` (`orchestration/ocr_space_client.py`)                                    | ✅ **Tested** — 11 tests (`test_ocr_space_client.py`). ✅ **Live-verified (2026-07-01):** a real OCR.space call OCR'd a CBC image → rows parsed → the adapter resolved all required codes. TLS goes through the OS trust store (`truststore`) for corporate-proxy CAs. |
+| File-analysis CLI — `analyze_report.py`                                                             | ✅ **Live-verified (2026-07-01)** — full six-layer run on a test image finished `status=success` (OCR.space → Supabase L2 → L3 → local Neo4j L4 → L5). Layer 4 returned **0 findings** (local graph incomplete — see Layer 4 row). Layer 6 (Gemini) verified live separately. Flags: `--no-reports`/`--model`/`--out-dir`/`--show-ocr`. |
+| FastAPI endpoints — `POST /api/analyze`, **`POST /api/analyze-file`**, `GET /api/health` (`api/routes.py`, `api/main.py`) | ✅ **Tested** — 5 API tests (`test_api_reports.py`, fake orchestrator + fake LLM) cover `recommendations` surfacing and the opt-in Layer 6 path. Response now includes **`recommendations`** and, when `include_reports=true`, the **Layer 6 `reports`** bundle (report generator is a best-effort startup singleton, disabled if `GEMINI_API_KEY` is unset). Per-request `AsyncSession` DI, lifespan wiring, best-effort DB/Neo4j init. ⏳ Not exercised over HTTP against live DB/OCR in this env. |
 | Layer 6 — LLM presentation (`services/presentation/`) | ✅ **Tested** with a fake LLM (`test_presentation_layer6.py`) **and live-verified** against the configured Gemini key (`gemini-2.5-flash`, thinking disabled): patient + clinician reports + exports produced from real graph-derived findings. Provider Gemini (low temperature, safety-block handling, `truststore` for proxy TLS); `AnthropicLLMClient` is a drop-in alternative. |
 | Layer 6 — deterministic exports (JSON/HL7v2/CSV/PDF-metadata) | ✅ **Tested** — pure functions over validated data; no LLM; deterministic. |
-| **Tests total**                                                                                     | ✅ **102 passing** (`pytest` in `backend/`): L2 37 · L3 26 · L4 15 · L5 8 · L6 16. The `ocr/` suite needs the OCR env and is not run with the backend suite.                                                                                                    |
+| **Tests total**                                                                                     | ✅ **132 passing** (`pytest` in `backend/`): L2 37 · L3 26 · L4 15 · L5 8 · L6 16 · domains 14 · Layer-1 OCR.space 11 · API 5.                                                                                                    |
 
 **Legacy / not in the runtime path** (present in the repo, intentionally unused):
 the PATTERN/anaemia-subtype `FeatureDefinition`s in `domains/cbc/features.py`
-(disease inference moved to Layer 4); the legacy standalone OCR app
-(`ocr/core/stage3–7` + `ocr/api`'s `/analyze` + `ocr/core/pipeline.py`) — the new
-extraction path is `PaddleOCRExtractor` + the OCR service's `/extract`.
-(`pattern_matcher.py` and `models/schemas.py` have been removed.)
+(disease inference moved to Layer 4). The former local OCR stack (`ocr/`,
+PaddleOCR, and the OCR microservice + `remote_ocr_client.py`) has been **removed** —
+extraction is now the OCR.space API via `OCRSpaceClient`. (`pattern_matcher.py` and
+`models/schemas.py` were removed earlier.)
 
 **Graph notes (data, not code):** Layer 4 reasons over whatever is in the live
 graph (seeded externally; we only read it via `NEO4J_URI`). Two data-side limits,
@@ -411,12 +409,36 @@ encoded only on `Threshold.operator` (so biomarkers without thresholds — HCT, 
 PLT — are non-directional), and there are no conflict edges (`detect_conflicts`
 returns `[]`).
 
-**Environment notes:** PaddleOCR vs PyTorch conflict on Windows (OCR runs without
-torch); `truststore` needed for OCR model download behind the corporate proxy;
-`DATABASE_URL` must use `asyncpg` (app) while `ALEMBIC_DATABASE_URL` uses
-`psycopg2` (migrations/seeds). `Neo4jConnection.connect()` falls back `neo4j://` →
-`bolt://` (single-instance routing) — set `NEO4J_URI`/`USER`/`PASSWORD` in `.env`.
+**Environment notes:** Layer 1 needs `OCR_SPACE_API_KEY` (OCR.space API); no local
+OCR/torch. A single Supabase `DATABASE_URL` drives the app — `db.session` derives
+the `asyncpg` (app) and `psycopg2` (migrations/seeds) drivers and the TLS / pooler
+connect args from it (`ALEMBIC_DATABASE_URL` is an optional sync override).
+`Neo4jConnection.connect()` falls back `neo4j://` → `bolt://` (single-instance
+routing) — set `NEO4J_URI`/`NEO4J_USERNAME`/`NEO4J_PASSWORD` in `.env` (local Neo4j
+now; Aura later, no code change).
 Layer 6 reads `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) from `.env`/env for the Gemini API.
+
+### Wiring status
+
+1. ✅ **Layer 6 is wired into the API (opt-in).** `/api/analyze` and
+   `/api/analyze-file` accept `include_reports` (bool). When true, the endpoint runs
+   `ReportGenerator` (a best-effort startup singleton in `api/main.py`, using
+   `GeminiLLMClient`) on the L5 output and returns the bundle under `reports`. When
+   `GEMINI_API_KEY` is unset the generator is disabled and `reports.status` is
+   `unavailable` (the analysis itself still succeeds). Report-gen failures never
+   fail the request. The orchestrators still run L2→L5 only — Layer 6 is driven by
+   the API/CLI, by design.
+2. ✅ **`recommendations` are surfaced.** `AnalyzeCBCResponse` now includes a
+   `recommendations` field, populated from the Layer 4 output on both endpoints.
+3. ⏳ **Layer 4 needs a fully-loaded graph to produce findings** (data, not code).
+   The traversal is correct and tested, but the current local Neo4j graph lacks the
+   CBC `Threshold.operator` data, so live runs return 0 findings until the full graph
+   is loaded (or `NEO4J_URI` points at a populated Aura instance).
+
+> **SSL note:** the Gemini client calls `truststore.inject_into_ssl()` (global
+> `ssl` monkeypatch). To keep that from breaking the Supabase asyncpg connection,
+> the DB layer passes asyncpg the `sslmode` **string** (e.g. `require`) rather than a
+> raw `ssl.SSLContext` object — verified live (DB → Gemini → DB in one process).
 
 ---
 
@@ -446,27 +468,26 @@ reports are handled per biomarker by normalization and feature generation.
 
 ---
 
-## 8. Deployment (Render — two microservices)
+## 8. Deployment (Render — single service)
 
-OCR is heavy (PaddleOCR) and clashes with torch, so it is deployed as a **separate
-service** from the backend; the backend reaches it over HTTP.
+OCR is now the OCR.space API and the database is Supabase, so the backend is a
+**single service** with no separate OCR process.
 
-| Service             | Root      | Start command                                  | Health        | Heavy deps |
-| ------------------- | --------- | ---------------------------------------------- | ------------- | ---------- |
-| `enervera-ocr`      | `ocr/`    | `uvicorn api.main:app --host 0.0.0.0 --port $PORT` | `/health`     | PaddleOCR  |
-| `enervera-backend`  | `backend/`| `uvicorn src.api.main:app --host 0.0.0.0 --port $PORT` | `/api/health` | —          |
+| Service             | Root      | Start command                                  | Health        |
+| ------------------- | --------- | ---------------------------------------------- | ------------- |
+| `enervera-backend`  | `backend/`| `uvicorn src.api.main:app --host 0.0.0.0 --port $PORT` | `/api/health` |
 
-- **`render.yaml`** (repo root) declares both services; secrets (`DATABASE_URL`,
-  `NEO4J_*`, `GEMINI_API_KEY`, `OCR_SERVICE_URL`) are `sync:false` — set them in the
-  Render dashboard, never in git.
-- Per-service deps: `ocr/requirements.txt` (paddle, opencv, pdfplumber, pymupdf)
-  and `backend/requirements.txt` (no paddle; adds `httpx` for the OCR client +
-  `google-genai`). The root `requirements.txt` is the unified set for **local**
-  end-to-end runs of `analyze_report.py`.
-- Flow: `POST /api/analyze-file` (backend) → `POST /extract` (OCR) → rows → Layer
-  1→2 adapter → orchestrator. Set `OCR_SERVICE_URL` to the OCR service's public URL.
-- **DB setup** (operator, once): `alembic upgrade head` then `python -m db.seed_runner`
-  against PostgreSQL.
+- **`render.yaml`** (repo root) declares the one service; secrets (`DATABASE_URL`,
+  `OCR_SPACE_API_KEY`, `NEO4J_URI/USERNAME/PASSWORD`, `GEMINI_API_KEY`) are
+  `sync:false` — set them in the Render dashboard, never in git. `OCR_SPACE_ENDPOINT`
+  and `ENVIRONMENT`/`LOG_LEVEL` have committed defaults.
+- Deps: `backend/requirements.txt` (no paddle; `httpx` for OCR.space, `asyncpg` +
+  `psycopg2` for Supabase, `google-genai` for Gemini). The root `requirements.txt`
+  mirrors it for **local** end-to-end runs of `analyze_report.py`.
+- Flow: `POST /api/analyze-file` (backend) → OCR.space API → rows → Layer 1→2
+  adapter → orchestrator.
+- **DB setup** (operator, once, against Supabase): `alembic upgrade head` then
+  `python -m db.seed_runner`.
 - **Secrets:** `.gitignore` excludes `.env`; `.env.example` documents every var.
 
 **Design note (Layer 4 ↔ Layer 5 separation):** Layer 4 emits candidate

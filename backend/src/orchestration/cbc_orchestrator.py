@@ -195,8 +195,8 @@ class CBCOrchestrator:
             layer3_output = self._build_layer3_output(layer2_output, generated)
             timings["layer3_ms"] = self._ms(t0)
             layers_ran.append("layer3")
-            self.logger.info("Layer 3 done in %.2fms: %d patterns detected",
-                             timings["layer3_ms"], len(layer3_output.detected_patterns))
+            self.logger.info("Layer 3 done in %.2fms: %d features generated",
+                             timings["layer3_ms"], len(layer3_output.generated_features))
         except Exception as exc:
             self.logger.error("Layer 3 failed: %s, continuing with defaults", exc)
             errors.append(f"layer3: {exc}")

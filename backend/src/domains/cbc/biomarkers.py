@@ -26,12 +26,15 @@ NAME_TO_CODE: Dict[str, str] = {
     "platelets": "PLT", "platelet": "PLT", "plt": "PLT", "platelet count": "PLT",
     "hematocrit": "HCT", "hct": "HCT", "pcv": "HCT", "packed cell volume": "HCT",
     "mcv": "MCV", "mch": "MCH", "mchc": "MCHC", "rdw": "RDW",
+    "neutrophils": "NEUT", "neutrophil": "NEUT", "neut": "NEUT",
+    "lymphocytes": "LYMPH", "lymphocyte": "LYMPH", "lymph": "LYMPH",
 }
 
 # Canonical code → the lowercase name used by UnitConverter / DataQualityChecker.
 CODE_TO_NAME: Dict[str, str] = {
     "HGB": "hemoglobin", "WBC": "wbc", "RBC": "rbc", "PLT": "platelets",
     "HCT": "hematocrit", "MCV": "mcv", "MCH": "mch", "MCHC": "mchc", "RDW": "rdw",
+    "NEUT": "neutrophils", "LYMPH": "lymphocytes",
 }
 
 # OCR-tolerant alias → code (Layer-1 adapter). Lowercase keys; fuzzy/de-spaced
@@ -54,10 +57,6 @@ BIOMARKER_LOOKUP: Dict[str, str] = {
     "red blood cell distribution width": "RDW", "rdw cv": "RDW",
     "neutrophils": "NEUT", "neutrophil": "NEUT", "neut": "NEUT",
     "lymphocytes": "LYMPH", "lymphocyte": "LYMPH", "lymph": "LYMPH",
-    "monocytes": "MONO", "monocyte": "MONO", "mono": "MONO",
-    "eosinophils": "EOS", "eosinophil": "EOS", "eos": "EOS",
-    "basophils": "BASO", "basophil": "BASO", "baso": "BASO",
-    "mpv": "MPV", "mean platelet volume": "MPV",
 }
 
 # ── LOINC ────────────────────────────────────────────────────────────────────
@@ -67,6 +66,7 @@ BIOMARKER_LOOKUP: Dict[str, str] = {
 CODE_TO_LOINC: Dict[str, str] = {
     "HGB": "718-7", "HCT": "4544-3", "MCV": "787-2", "MCH": "785-6",
     "MCHC": "786-4", "PLT": "777-3", "WBC": "6690-2", "RBC": "789-8", "RDW": "788-0",
+    "NEUT": "770-8", "LYMPH": "736-9",   # neutrophils/100 leukocytes, lymphocytes/100 leukocytes
 }
 
 # ── Graph bridge (Layer 4) ───────────────────────────────────────────────────
@@ -108,8 +108,4 @@ CODE_TO_GRAPH_NAMES: Dict[str, List[str]] = {
     "RDW": ["rdw", "rcdw", "red cell distribution width (rdw)", "red cell distribution width"],
     "NEUT": ["neutrophils", "neutrophil count", "absolute neutrophil count"],
     "LYMPH": ["lymphocytes", "lymphocyte", "lymphocyte count"],
-    "MONO": ["monocytes", "monocyte count"],
-    "EOS": ["eosinophils", "eosinophil count", "total eosinophil count"],
-    "BASO": ["basophils", "basophil count"],
-    "MPV": ["mpv", "mean platelet volume (mpv)"],
 }

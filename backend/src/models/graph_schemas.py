@@ -171,6 +171,11 @@ class Layer4Output(BaseModel):
     error_messages: List[str] = Field(
         default_factory=list, description="Per-step failures (status is 'partial' if non-empty)."
     )
+    diagnostics: List[str] = Field(
+        default_factory=list,
+        description="Explicit zero-result diagnostics (empty graph / contract violation / "
+                    "missing traversal / unmatched biomarkers / genuine absence). Empty on success.",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={

@@ -1,10 +1,10 @@
 """
 Alembic environment.
 
-The database URL comes from the project .env (``ALEMBIC_DATABASE_URL``, falling
-back to ``DATABASE_URL``) via the app's settings — never hard-coded here. The
-target metadata is ``db.models.Base.metadata`` so ``--autogenerate`` sees the
-ORM models.
+The sync (psycopg2) database URL is derived from the project .env by
+``db.session.sync_database_url`` (``ALEMBIC_DATABASE_URL`` if set, else the driver
+is swapped onto ``DATABASE_URL``) — never hard-coded here. The target metadata is
+``db.models.Base.metadata`` so ``--autogenerate`` sees the ORM models.
 """
 
 import os
@@ -20,8 +20,8 @@ _SRC = os.path.join(_HERE, "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from db.config import get_settings   # noqa: E402
-from db.models import Base           # noqa: E402  (imports all ORM models)
+from db.models import Base              # noqa: E402  (imports all ORM models)
+from db.session import sync_database_url  # noqa: E402  (derives the psycopg2 URL)
 
 config = context.config
 
@@ -29,14 +29,10 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Inject the sync DB URL from settings (keeps credentials out of alembic.ini).
-_settings = get_settings()
-_db_url = _settings.alembic_database_url or _settings.database_url
-if not _db_url:
-    raise RuntimeError(
-        "No database URL for Alembic. Set ALEMBIC_DATABASE_URL (or DATABASE_URL) "
-        "in the project .env."
-    )
-config.set_main_option("sqlalchemy.url", _db_url)
+# Raises if neither DATABASE_URL nor ALEMBIC_DATABASE_URL is configured. Escape
+# '%' as '%%' so ConfigParser does not treat URL-encoded chars (e.g. '%40' in a
+# password) as interpolation syntax.
+config.set_main_option("sqlalchemy.url", sync_database_url().replace("%", "%%"))
 
 target_metadata = Base.metadata
 

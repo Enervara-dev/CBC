@@ -53,7 +53,8 @@ class Neo4jConnection:
 
     def __init__(self) -> None:
         self.uri: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        self.user: str = os.getenv("NEO4J_USER", "neo4j")
+        # NEO4J_USERNAME is the documented name; NEO4J_USER kept as a fallback.
+        self.user: str = os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER", "neo4j")
         self.password: Optional[str] = os.getenv("NEO4J_PASSWORD")
         self.logger = logging.getLogger(__name__)
         self._driver: Any = None  # neo4j.AsyncDriver once connected
