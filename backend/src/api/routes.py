@@ -22,6 +22,8 @@ import os
 import tempfile
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+
+from api.auth import api_key_scheme
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -188,7 +190,7 @@ async def _build_reports(
 # ─────────────────────────────────────────────────────────────────────────────
 # Endpoint
 # ─────────────────────────────────────────────────────────────────────────────
-@router.post("/analyze", response_model=AnalyzeCBCResponse)
+@router.post("/analyze", response_model=AnalyzeCBCResponse, dependencies=[Depends(api_key_scheme)])
 async def analyze_cbc(
     request: AnalyzeCBCRequest,
     db: AsyncSession = Depends(get_db),
@@ -272,7 +274,7 @@ async def analyze_cbc(
 _SUPPORTED_UPLOAD_EXT = (".pdf", ".png", ".jpg", ".jpeg")
 
 
-@router.post("/analyze-file", response_model=AnalyzeCBCResponse)
+@router.post("/analyze-file", response_model=AnalyzeCBCResponse, dependencies=[Depends(api_key_scheme)])
 async def analyze_file(
     file: UploadFile = File(..., description="CBC report (PDF or image)."),
     patient_id: str = Form(...),

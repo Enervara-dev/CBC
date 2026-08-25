@@ -38,6 +38,7 @@ if _SRC_DIR not in sys.path:
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker  # noqa: E402
 
+from api.auth import api_key_middleware  # noqa: E402
 from api.routes import (  # noqa: E402
     init_db,
     init_normalizer_factory,
@@ -168,6 +169,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(router)
+
+# Enforced for every path except api.auth.PUBLIC_PATHS. Registered after the
+# router so it wraps the real routes; `/api/health` stays open because the
+# ALB health check cannot send a custom header.
+app.middleware("http")(api_key_middleware)
 
 
 @app.get("/", tags=["health"])
