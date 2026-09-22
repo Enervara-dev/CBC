@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import ssl
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -49,7 +50,7 @@ def _truststore_verify() -> Union[bool, ssl.SSLContext]:
     (``CERTIFICATE_VERIFY_FAILED``). We build a *local* ``truststore`` context and
     hand it to httpx's ``verify`` rather than calling ``truststore.inject_into_ssl()``
     — global injection monkeypatches ``ssl.SSLContext`` and breaks the explicit SSL
-    context the asyncpg (Supabase) engine passes for the DB connection.
+    context the asyncpg (Aurora) engine passes for the DB connection.
     """
     try:
         import truststore
@@ -76,9 +77,86 @@ _FILETYPE_BY_EXT: Dict[str, str] = {
 
 # First numeric token in a line (the biomarker value). Comma treated as a thousands
 # separator (stripped) to match the previous PaddleOCR parser's behaviour.
-_NUMBER = re.compile(r"[<>]?\s*(\d+(?:[.,]\d+)?)")
+# A numeric token, allowing grouped digits: "85.6", "0,4", "150,000", "2,88,000".
+# Whether a comma is a decimal point or a group separator is decided in
+# :func:`_parse_number` — the two are indistinguishable to the regex.
+_NUMBER = re.compile(r"[<>]?\s*(\d+(?:[.,]\d+)*)")
 # A unit-looking token (letters, %, slash, caret, digits) immediately after the value.
 _UNIT_TOKEN = re.compile(r"[A-Za-z%/][A-Za-z0-9%/^.\-]*")
+
+
+# Largest upload we will send to OCR.space in one request. The free plan rejects
+# anything over 1.5 MB (E556); this sits below it to leave room for the multipart
+# envelope. Oversized PDFs are split per page instead of failing.
+DEFAULT_MAX_UPLOAD_BYTES = 1_200_000
+
+
+def _needs_page_split(file_path: str, max_bytes: int) -> bool:
+    """True if ``file_path`` is a PDF too large to upload in one request."""
+    if os.path.splitext(file_path)[1].lower() != ".pdf":
+        return False          # images cannot be split; send them and let OCR decide
+    try:
+        return os.path.getsize(file_path) > max_bytes
+    except OSError:
+        return False
+
+
+def _split_pdf_pages(file_path: str) -> List[str]:
+    """
+    Write each page of ``file_path`` to its own temp PDF and return the paths.
+
+    The caller owns the returned files and must delete them.
+    """
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError as exc:   # pragma: no cover - dependency is declared
+        raise OCRSpaceError(
+            "pypdf is required to split oversized PDFs for OCR. Run: pip install pypdf"
+        ) from exc
+
+    try:
+        reader = PdfReader(file_path)
+    except Exception as exc:
+        raise OCRSpaceError(f"Could not read PDF {os.path.basename(file_path)}: {exc}") from exc
+
+    paths: List[str] = []
+    for index, page in enumerate(reader.pages, start=1):
+        writer = PdfWriter()
+        writer.add_page(page)
+        handle = tempfile.NamedTemporaryFile(
+            delete=False, suffix=f"_p{index:03d}.pdf", prefix="ocr_page_"
+        )
+        try:
+            writer.write(handle)
+        finally:
+            handle.close()
+        paths.append(handle.name)
+    return paths
+
+
+def _parse_number(token: str) -> float:
+    """
+    Convert a numeric token to a float, resolving comma ambiguity.
+
+    A comma in a lab report is either a decimal point ("0,4" = 0.4 — common on
+    Indian and European printers) or a digit-group separator ("150,000", and the
+    Indian lakh grouping "2,88,000"). Stripping every comma unconditionally — the
+    previous behaviour — turned a total bilirubin of 0,4 mg/dL into 4.0, a 10x
+    error that read as jaundice.
+
+    The rule: a *single* comma trailed by one or two digits is a decimal point;
+    anything else (several commas, a trailing group of three, or a token that also
+    contains a period) is digit grouping.
+    """
+    token = token.strip()
+    if "," not in token:
+        return float(token)
+    if "." in token:                      # "1,234.5" — comma must be grouping
+        return float(token.replace(",", ""))
+    parts = token.split(",")
+    if len(parts) == 2 and len(parts[1]) in (1, 2):
+        return float(f"{parts[0]}.{parts[1]}")
+    return float(token.replace(",", ""))
 
 
 class OCRSpaceError(RuntimeError):
@@ -94,6 +172,7 @@ class OCRSpaceClient:
         endpoint: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES,
         ocr_engine: int = 2,
         language: str = "eng",
     ) -> None:
@@ -101,6 +180,7 @@ class OCRSpaceClient:
         self.endpoint = (endpoint or os.getenv("OCR_SPACE_ENDPOINT", DEFAULT_ENDPOINT)).strip()
         self.timeout = timeout
         self.max_retries = max(1, max_retries)
+        self.max_upload_bytes = max_upload_bytes
         self.ocr_engine = ocr_engine
         self.language = language
         if not self.api_key:
@@ -139,7 +219,60 @@ class OCRSpaceClient:
 
     # ── OCR.space call (with retries) ──────────────────────────────────────────
     async def _ocr_text(self, file_path: str) -> str:
-        """POST the file to OCR.space and return the concatenated parsed text."""
+        """
+        OCR ``file_path``, splitting oversized PDFs into single pages first.
+
+        OCR.space enforces a per-upload size cap (1.5 MB on the free plan) and
+        rejects anything larger with HTTP 413 / E556 — which this client turns
+        into an ``OCRSpaceError`` and the API surfaces as a 502. Real lab reports
+        are multi-page scans that routinely exceed it: the three used to validate
+        this pipeline were 3.9 MB, 2.6 MB and 2.2 MB, so *every one of them*
+        failed outright while their individual pages were 149-490 KB.
+
+        So a PDF over the threshold is split and OCR'd a page at a time, and the
+        page texts are concatenated in order — the same text a single call would
+        have produced. A page that fails is recorded inline and the rest continue,
+        so one bad page no longer costs the whole report.
+        """
+        if _needs_page_split(file_path, self.max_upload_bytes):
+            return await self._ocr_pdf_by_page(file_path)
+        return await self._ocr_single(file_path)
+
+    async def _ocr_pdf_by_page(self, file_path: str) -> str:
+        """Split a PDF into single-page files and OCR each, preserving order."""
+        pages = _split_pdf_pages(file_path)
+        logger.info("OCR: %s exceeds %d bytes — split into %d pages",
+                    os.path.basename(file_path), self.max_upload_bytes, len(pages))
+        chunks: List[str] = []
+        failures = 0
+        try:
+            for index, page_path in enumerate(pages, start=1):
+                try:
+                    chunks.append(await self._ocr_single(page_path))
+                except OCRSpaceError as exc:
+                    failures += 1
+                    logger.warning("OCR failed on page %d/%d: %s", index, len(pages), exc)
+                    chunks.append(f"<<OCR failed on page {index}: {exc}>>")
+        finally:
+            for page_path in pages:
+                try:
+                    os.unlink(page_path)
+                except OSError:
+                    pass
+
+        if failures == len(pages):
+            raise OCRSpaceError(
+                f"OCR failed on all {len(pages)} pages of {os.path.basename(file_path)}."
+            )
+        text = "\n".join(chunks).strip()
+        if not text:
+            raise OCRSpaceError(f"No text recovered from {os.path.basename(file_path)}.")
+        logger.info("OCR: %d/%d pages succeeded, %d chars total",
+                    len(pages) - failures, len(pages), len(text))
+        return text
+
+    async def _ocr_single(self, file_path: str) -> str:
+        """POST one file to OCR.space and return the concatenated parsed text."""
         import httpx  # local import keeps httpx optional for non-file callers
 
         ext = os.path.splitext(file_path)[1].lower()
@@ -234,7 +367,7 @@ class OCRSpaceClient:
             if not name or not re.search(r"[A-Za-z]", name):
                 continue
             try:
-                value = float(match.group(1).replace(",", ""))
+                value = _parse_number(match.group(1))
             except ValueError:
                 continue
 

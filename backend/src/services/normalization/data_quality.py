@@ -1,6 +1,7 @@
 """
-Data-quality checks for CBC biomarker values — outlier / impossibility / critical
-("panic") value detection. Pure and static; no database dependency.
+Data-quality checks for lab biomarker values (every registered panel) — outlier /
+impossibility / critical ("panic") value detection. Pure and static; no database
+dependency.
 
 Two tiers of checks:
   1. ABSOLUTE_LIMITS  — the physiologically possible range. A value outside this
@@ -8,6 +9,11 @@ Two tiers of checks:
      ``valid=False`` and ``critical_flag=True``.
   2. CRITICAL_VALUES  — possible but life-threatening values. These stay
      ``valid=True`` (the number is real) but are marked ``critical_flag=True``.
+
+Both tiers are **panel knowledge**, so the limits live in each domain's
+``units.py`` (``domains/<panel>/units.py``) and are merged here across every
+registered domain. A biomarker absent from a table is simply not checked at that
+tier.
 """
 
 from __future__ import annotations
@@ -15,39 +21,30 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from domains.registry import merged_unit_rules
+
 logger = logging.getLogger(__name__)
+
+_UNIT_RULES = merged_unit_rules()
 
 
 class DataQualityChecker:
     """
-    Static outlier / impossibility / critical-value checker for CBC biomarkers.
+    Static outlier / impossibility / critical-value checker for lab biomarkers.
 
-    Class constants define the thresholds; all methods are static so the checker
-    can be used without instantiation and without any I/O.
+    The thresholds come from the registered domains (merged at import); all
+    methods are static so the checker can be used without instantiation and
+    without any I/O.
     """
 
     # Physiologically possible bounds — outside ⇒ impossible (extraction/unit error)
-    ABSOLUTE_LIMITS: Dict[str, Dict[str, float]] = {
-        "hemoglobin": {"min": 0.5, "max": 25.0},
-        "wbc":        {"min": 0.1, "max": 100.0},
-        "platelets":  {"min": 1,   "max": 2000},
-        "hematocrit": {"min": 1,   "max": 90},
-    }
+    ABSOLUTE_LIMITS: Dict[str, Dict[str, float]] = _UNIT_RULES["absolute_limits"]
 
     # Life-threatening ("panic") thresholds — real but require urgent attention
-    CRITICAL_VALUES: Dict[str, Dict[str, float]] = {
-        "hemoglobin": {"low": 3.0, "high": 20.0},
-        "wbc":        {"low": 0.5, "high": 50.0},
-        "platelets":  {"low": 10,  "high": 1500},
-    }
+    CRITICAL_VALUES: Dict[str, Dict[str, float]] = _UNIT_RULES["critical_values"]
 
     # Pretty names for human-readable messages
-    DISPLAY_NAMES: Dict[str, str] = {
-        "hemoglobin": "Hemoglobin",
-        "wbc": "WBC",
-        "platelets": "Platelets",
-        "hematocrit": "Hematocrit",
-    }
+    DISPLAY_NAMES: Dict[str, str] = _UNIT_RULES["display_names"]
 
     @staticmethod
     def check_biomarker(biomarker_id: str, value: float, unit: str) -> Dict[str, Any]:

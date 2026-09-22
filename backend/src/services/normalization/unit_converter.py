@@ -1,5 +1,5 @@
 """
-Unit conversion for CBC biomarker values.
+Unit conversion for lab biomarker values (every registered panel).
 
 A small, self-contained, deterministic converter — no database required. Each
 biomarker has a set of accepted units, each expressed as a multiplicative factor
@@ -13,6 +13,11 @@ units is therefore:
 The standard unit of each biomarker has factor ``1.0`` and is recorded in
 ``STANDARD_UNITS`` (used as the default target when ``to_unit`` is omitted).
 
+The factor tables are **panel knowledge**, so they live in each domain's
+``units.py`` (``domains/<panel>/units.py``) and are merged here across every
+registered domain — CBC, LFT, Lipid, and whatever is registered next. Adding a
+biomarker's units is therefore a domain edit, not a service edit.
+
 Examples
 --------
 >>> UnitConverter.convert("hemoglobin", 100.0, "g/L", "g/dL")
@@ -23,15 +28,39 @@ Examples
 
 from __future__ import annotations
 
+import re
 import logging
 from typing import Dict, Optional, Tuple
 
+from domains.registry import merged_unit_rules
+
 logger = logging.getLogger(__name__)
+
+_UNIT_RULES = merged_unit_rules()
+
+
+# OCR routinely mangles the "per cubic millimetre" denominator Indian laboratories
+# print: a real CMR report came through as "lakhs/cumnt.5" and "X1000cells/curtr".
+# Treated as unknown, the platelet count of 1.21 lakhs/cumm (121 K/uL, mildly low)
+# was read as 1.21 K/uL and escalated as critical thrombocytopenia. So a
+# denominator that starts like "/cu" or "/cm" reads as "/cumm", and spelling
+# variants of the numerator fold together.
+_CUMM_DENOMINATOR = re.compile(r"/c[um][a-z.\d]*$")
+_NUMERATOR_VARIANTS = (("lacs", "lakhs"), ("lakh/", "lakhs/"), ("lac/", "lakhs/"))
+
+
+def _unit_key(unit: str) -> str:
+    """A spelling of ``unit`` that survives common OCR damage (for matching only)."""
+    key = re.sub(r"\s+", "", unit.lower())
+    key = _CUMM_DENOMINATOR.sub("/cumm", key)
+    for variant, canonical in _NUMERATOR_VARIANTS:
+        key = key.replace(variant, canonical)
+    return key
 
 
 class UnitConverter:
     """
-    Static converter for CBC biomarker units.
+    Static converter for lab biomarker units, across every registered panel.
 
     Attributes
     ----------
@@ -44,39 +73,17 @@ class UnitConverter:
 
     Notes
     -----
-    Factors are applied verbatim from the table below — it is the single source
-    of truth for the supported CBC analytes.
+    Factors are applied verbatim from the merged domain tables — those are the
+    single source of truth for the supported analytes (see
+    ``domains/<panel>/units.py``).
     """
 
-    # factor = multiplier to convert a value FROM this unit TO the biomarker's standard unit
-    CONVERSION_FACTORS: Dict[str, Dict[str, float]] = {
-        "hemoglobin": {"g/dL": 1.0, "g/L": 0.1, "mmol/L": 0.621},
-        "wbc":        {"K/uL": 1.0, "10^3/uL": 1.0, "10^9/L": 1.0},
-        "mcv":        {"fL": 1.0, "um^3": 1.0},
-        "mch":        {"pg": 1.0, "fmol": 0.0621},
-        "mchc":       {"g/dL": 1.0, "g/L": 0.1},
-        "rbc":        {"M/uL": 1.0, "10^6/uL": 1.0, "10^12/L": 1.0},
-        "platelets":  {"K/uL": 1.0, "10^3/uL": 1.0, "10^9/L": 1.0},
-        "hematocrit": {"%": 1.0, "L/L": 100.0, "fraction": 100.0},
-        "rdw":        {"%": 1.0},
-        "neutrophils": {"%": 1.0},
-        "lymphocytes": {"%": 1.0},
-    }
+    # factor = multiplier to convert a value FROM this unit TO the biomarker's
+    # standard unit; merged across every registered panel.
+    CONVERSION_FACTORS: Dict[str, Dict[str, float]] = _UNIT_RULES["conversion_factors"]
 
     # standard (canonical) unit per biomarker — the one with factor 1.0
-    STANDARD_UNITS: Dict[str, str] = {
-        "hemoglobin": "g/dL",
-        "wbc": "K/uL",
-        "mcv": "fL",
-        "mch": "pg",
-        "mchc": "g/dL",
-        "rbc": "M/uL",
-        "platelets": "K/uL",
-        "hematocrit": "%",
-        "rdw": "%",
-        "neutrophils": "%",
-        "lymphocytes": "%",
-    }
+    STANDARD_UNITS: Dict[str, str] = _UNIT_RULES["standard_units"]
 
     @staticmethod
     def convert(
@@ -139,13 +146,15 @@ class UnitConverter:
             )
 
         factors = UnitConverter.CONVERSION_FACTORS[biomarker]
-        converted = round(value * factors[src] / factors[dst], 6)
+        src_key = UnitConverter._resolve_unit(biomarker, src)
+        dst_key = UnitConverter._resolve_unit(biomarker, dst)
+        converted = round(value * factors[src_key] / factors[dst_key], 6)
 
         logger.info(
             "UnitConverter.convert: %s | %s %s -> %s %s",
-            biomarker, value, src, converted, dst,
+            biomarker, value, src, converted, dst_key,
         )
-        return converted, dst
+        return converted, dst_key
 
     @staticmethod
     def _get_standard_unit(biomarker_id: str) -> str:
@@ -168,9 +177,31 @@ class UnitConverter:
         return biomarker_id.strip().lower() in UnitConverter.CONVERSION_FACTORS
 
     @staticmethod
+    def _resolve_unit(biomarker_id: str, unit: str) -> Optional[str]:
+        """
+        Return the table's spelling of ``unit`` for ``biomarker_id``, or ``None``.
+
+        Matching is case-insensitive: reports print "Cells/cumm", "CELLS/CUMM" and
+        "cells/cumm" for the same unit, and the table cannot carry every casing.
+
+        Failing that, it is OCR-tolerant (see :func:`_unit_key`) — but only when
+        every table unit sharing the tolerant spelling converts identically, so it
+        never guesses between two scales.
+        """
+        factors = UnitConverter.CONVERSION_FACTORS.get(biomarker_id.strip().lower())
+        if not factors:
+            return None
+        wanted = unit.strip().lower()
+        exact = next((u for u in factors if u.lower() == wanted), None)
+        if exact or not wanted:
+            return exact
+        key = _unit_key(unit)
+        candidates = sorted(u for u in factors if _unit_key(u) == key)
+        if candidates and len({factors[u] for u in candidates}) == 1:
+            return candidates[0]
+        return None
+
+    @staticmethod
     def _validate_unit(biomarker_id: str, unit: str) -> bool:
         """Return ``True`` if ``unit`` is an accepted unit for ``biomarker_id``."""
-        biomarker = biomarker_id.strip().lower()
-        if biomarker not in UnitConverter.CONVERSION_FACTORS:
-            return False
-        return unit.strip() in UnitConverter.CONVERSION_FACTORS[biomarker]
+        return UnitConverter._resolve_unit(biomarker_id, unit) is not None

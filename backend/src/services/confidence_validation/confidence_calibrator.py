@@ -118,20 +118,32 @@ class ConfidenceCalibrator:
         evidence_count: int,
         consistency: str = "all_consistent",
         severity: str = "routine",
+        measured: bool = False,
     ) -> Dict[str, Any]:
         """
         Calibrate a confidence score by evidence count, consistency, and severity.
 
+        ``measured`` marks an *observation* rather than an inference: "the
+        haemoglobin is 6.2 g/dL and that is below the reference range" is a
+        directly measured fact, and discounting it for resting on a single piece
+        of evidence — itself — understates it badly. Such findings skip the
+        evidence-count factor; consistency and severity still apply, so a
+        conflicting or critical observation is still moderated.
+
         Returns ``{"original", "final", "factors": {evidence_count, consistency,
         severity}}``.
         """
-        if evidence_count >= 3:
+        if measured:
+            ec_key = "measured_observation"
+        elif evidence_count >= 3:
             ec_key = "3_or_more_evidence"
         elif evidence_count == 2:
             ec_key = "2_evidence"
         else:
             ec_key = "1_evidence"
 
+        # "measured_observation" is intentionally absent from the domain tables:
+        # the default of 1.0 is the point — no discount for an observed value.
         ec_factor = self.calibration["evidence_count_factor"].get(ec_key, 1.0)
         cons_factor = self.calibration["consistency_factor"].get(consistency, 1.0)
         # Accept the legacy "hemoglobin_severity_factor" key as a fallback so an

@@ -1,6 +1,6 @@
 # ── ENERVERA CBC — Render deployment (single service) ──
 # One backend runs all six layers. Layer 1 is the OCR.space REST API and the
-# database is Supabase PostgreSQL, so there is no separate OCR microservice.
+# database is AWS Aurora PostgreSQL, so there is no separate OCR microservice.
 #
 # Set secret values (DATABASE_URL, OCR_SPACE_API_KEY, NEO4J_*, GEMINI_API_KEY) in
 # the Render dashboard — they are intentionally not committed here.
@@ -19,7 +19,7 @@ services:
       - key: PYTHON_VERSION
         value: "3.11"
       # ── Secrets — set these in the Render dashboard (sync:false keeps them off git).
-      # Supabase connection string (async/sync drivers derived from it).
+      # Aurora PostgreSQL connection string (async/sync drivers derived from it).
       - key: DATABASE_URL
         sync: false
       # OCR.space (Layer 1).

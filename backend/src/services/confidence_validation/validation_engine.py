@@ -20,6 +20,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from domains.registry import DEFAULT_DOMAIN, domain_for_code, merged_code_to_name
 from models.graph_schemas import Layer4Output
 from models.validation_schemas import (
     ClinicalFlag,
@@ -32,11 +33,12 @@ from services.confidence_validation.confidence_calibrator import (
     SEVERITY_ORDER,
 )
 
-# graph/Layer-2 biomarker code → severity-threshold key
-_CODE_TO_BIOMARKER = {
-    "HGB": "hemoglobin", "WBC": "wbc", "PLT": "platelets", "HCT": "hematocrit",
-    "RBC": "rbc", "MCV": "mcv", "MCH": "mch", "MCHC": "mchc", "RDW": "rdw",
-}
+# graph/Layer-2 biomarker code → severity-threshold key, for every registered
+# panel (the threshold tables are keyed by canonical name, not code).
+_CODE_TO_BIOMARKER = merged_code_to_name()
+
+# The four-band vocabulary Layer 4 grades in.
+_GRADES = ("critical", "urgent", "routine", "normal")
 
 
 class ConfidenceValidationEngine:
@@ -102,7 +104,15 @@ class ConfidenceValidationEngine:
             errors.append(f"rule_validation: {exc}")
 
         # severity per finding (used by both calibration and urgency mapping)
-        severities = {f.finding_id: self._finding_severity(f, biomarker_values) for f in findings}
+        # Layer 4 grades against the patient's own range (sex, age, pregnancy) and
+        # the condition's grading markers; the generic bands here cannot, and
+        # re-grading turned a routine hypercholesterolaemia "urgent" because its
+        # evidence also carried an LDL. Recompute only when no grade was given.
+        severities = {
+            f.finding_id: (f.severity if f.severity in _GRADES
+                           else self._finding_severity(f, biomarker_values))
+            for f in findings
+        }
 
         # STEP 3 — calibrate confidence
         adjustments: Dict[str, Any] = {}
@@ -110,11 +120,17 @@ class ConfidenceValidationEngine:
             for finding in findings:
                 validation = validations.get(finding.finding_id, {})
                 consistency = "conflicting" if validation.get("contradictions") else "all_consistent"
+                # A finding sourced directly from a measured biomarker is an
+                # observation, not an inference (see ``calibrate_confidence``).
+                # So is a condition that *is* a threshold on one measured value.
+                source = str(getattr(finding, "source_pattern", ""))
+                measured = source.startswith("biomarker:") or source.endswith(":threshold")
                 cal = self.calibrator.calibrate_confidence(
                     original_confidence=finding.confidence,
                     evidence_count=len(finding.evidence_chain),
                     consistency=consistency,
                     severity=severities.get(finding.finding_id, "routine"),
+                    measured=measured,
                 )
                 adjustments[finding.finding_id] = await self._build_confidence_adjustment_report(
                     cal["original"], cal["final"], cal["factors"]
@@ -133,8 +149,10 @@ class ConfidenceValidationEngine:
                 severity = severities.get(finding.finding_id, "routine")
                 if severity in ("critical", "urgent"):
                     final_conf = adjustments.get(finding.finding_id, {}).get("final", finding.confidence)
-                    escalation = await self._get_escalation_level(severity, final_conf)
-                    urgency = self.rules["urgency_flags"].get(severity, {}).get("urgency", "ROUTINE")
+                    codes = [link.biomarker_id for link in finding.evidence_chain
+                             if getattr(link, "biomarker_id", None)]
+                    escalation = await self._get_escalation_level(severity, final_conf, codes)
+                    urgency = self._urgency_entry(severity, codes).get("urgency", "ROUTINE")
                     flags[severity].append(ClinicalFlag(
                         flag_id=f"flag_{finding.finding_id}_{severity}",
                         flag_type=severity,
@@ -176,7 +194,7 @@ class ConfidenceValidationEngine:
                 status=status,
             )
             ff.clinical_notes = await self._generate_clinical_notes(
-                ff, [link.model_dump() for link in finding.evidence_chain]
+                ff, [link.model_dump() for link in finding.evidence_chain], finding
             )
             final_findings.append(ff)
 
@@ -229,9 +247,20 @@ class ConfidenceValidationEngine:
         return "APPROVED_FOR_REVIEW"
 
     async def _generate_clinical_notes(
-        self, finding: FinalFinding, evidence: List[Dict[str, Any]]
+        self,
+        finding: FinalFinding,
+        evidence: List[Dict[str, Any]],
+        source: Any = None,
     ) -> str:
-        """Generate a human-readable clinical explanation for a finding."""
+        """
+        Generate a human-readable clinical explanation for a finding.
+
+        ``source`` is the Layer-4 :class:`ValidatedFinding`. When it carries an
+        interpretation (the rule reasoner populates one from the domain tables),
+        the note explains what the abnormality *means* and what to consider —
+        without it a clinician receives a severity label and a number, which is
+        the gap this pipeline exists to close.
+        """
         support = "; ".join(e.get("narrative", "") for e in evidence if e.get("narrative"))
         head = (f"{finding.finding_name} — {finding.severity} "
                 f"(confidence {finding.final_confidence:.0%}).")
@@ -239,15 +268,27 @@ class ConfidenceValidationEngine:
             return f"{head} VALIDATION INCOMPLETE — requires manual review. " + (
                 f"Supporting evidence: {support}." if support else "Insufficient evidence."
             )
-        body = f" Supported by: {support}." if support else ""
-        return f"{head}{body}"
+
+        parts = [head]
+        meaning = getattr(source, "interpretation", "") if source else ""
+        if meaning:
+            parts.append(meaning)
+        critical_note = getattr(source, "critical_note", "") if source else ""
+        if critical_note and finding.severity in ("critical", "urgent"):
+            parts.append(critical_note)
+        consider = list(getattr(source, "consider", []) or []) if source else []
+        if consider:
+            parts.append("Consider: " + "; ".join(consider) + ".")
+        if support:
+            parts.append(f"Supported by: {support}.")
+        return " ".join(parts)
 
     async def _generate_next_steps(self, findings: List[FinalFinding]) -> List[str]:
         """Return actionable next steps for the clinician."""
         steps: List[str] = []
         for f in findings:
             if f.severity == "critical":
-                steps.append(f"URGENT: review {f.finding_name} and arrange hematology consult.")
+                steps.append(f"URGENT: review {f.finding_name} and arrange a specialist consult.")
             elif f.severity == "urgent":
                 steps.append(f"Review {f.finding_name} within 24h; specialist review advised.")
             elif not f.validation_passed:
@@ -258,9 +299,34 @@ class ConfidenceValidationEngine:
             steps.append("No findings to action; routine monitoring.")
         return steps
 
-    async def _get_escalation_level(self, severity: str, confidence: float) -> Optional[str]:
-        """Map severity (+confidence) to an escalation path."""
-        escalation = self.rules["urgency_flags"].get(severity, {}).get("escalation")
+    def _urgency_entry(self, severity: str, biomarker_codes: List[str]) -> Dict[str, Any]:
+        """
+        The urgency/escalation entry for ``severity``, routed to the right panel.
+
+        Escalation is panel-specific (a critical haemoglobin goes to haematology,
+        a critical bilirubin to hepatology), so when the rule bundle carries
+        per-panel tables (``urgency_flags_by_domain``, built by
+        ``domains.registry.merged_validation_rules``) the finding's own biomarkers
+        choose the table. Falls back to the bundle's default panel.
+        """
+        by_domain = self.rules.get("urgency_flags_by_domain") or {}
+        default = self.rules.get("urgency_flags", {})
+        if by_domain:
+            panels = [d for d in (domain_for_code(c) for c in biomarker_codes) if d]
+            panel = panels[0] if panels else DEFAULT_DOMAIN
+            table = by_domain.get(panel) or by_domain.get(DEFAULT_DOMAIN) or default
+        else:
+            table = default
+        return table.get(severity, {})
+
+    async def _get_escalation_level(
+        self,
+        severity: str,
+        confidence: float,
+        biomarker_codes: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Map severity (+confidence) to an escalation path for the finding's panel."""
+        escalation = self._urgency_entry(severity, biomarker_codes or []).get("escalation")
         return escalation.lower() if isinstance(escalation, str) else None
 
     async def _build_confidence_adjustment_report(

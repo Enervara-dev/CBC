@@ -4,8 +4,8 @@ Specialty template — copy this folder to add a new panel (LFT, Lipid, …).
 Steps
 -----
 1. Copy ``domains/_template`` → ``domains/<your_panel>`` (e.g. ``domains/lft``).
-2. Fill in the four data modules: ``biomarkers.py``, ``features.py``,
-   ``validation.py``, ``reference_ranges.py``.
+2. Fill in the five data modules: ``biomarkers.py``, ``features.py``,
+   ``validation.py``, ``reference_ranges.py``, ``units.py``.
 3. Set ``key`` / ``name`` below and keep this ``DOMAIN`` export.
 4. Register it in ``domains/registry.py`` (one line — see that file).
 
@@ -28,6 +28,7 @@ from domains._template.biomarkers import (
 from domains._template.features import FEATURE_REGISTRY
 from domains._template.validation import load_validation_rules
 from domains._template.reference_ranges import reference_range_rows
+from domains._template.units import load_unit_rules
 
 DOMAIN = DomainConfig(
     key="template",          # ← change to your panel key, e.g. "lft"
@@ -42,6 +43,7 @@ DOMAIN = DomainConfig(
     feature_registry=FEATURE_REGISTRY,
     validation_rules=load_validation_rules,
     reference_range_rows=reference_range_rows,
+    unit_rules=load_unit_rules,
 )
 
 __all__ = ["DOMAIN"]

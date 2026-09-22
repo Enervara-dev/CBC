@@ -24,52 +24,14 @@ threshold is always the reference bound that the value must cross to be abnormal
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List
 
-VALID_FEATURE_TYPES = ("BINARY", "SEVERITY", "RATIO", "PATTERN")
-
-
-@dataclass
-class FeatureDefinition:
-    """
-    One clinical feature in the library.
-
-    Attributes
-    ----------
-    feature_id : str               unique key, e.g. "hemoglobin_low"
-    feature_type : str             one of VALID_FEATURE_TYPES
-    feature_name : str             human-readable name
-    biomarker_id : str             primary biomarker (BINARY/SEVERITY); "" for multi-marker
-    threshold_low : Optional[float]   cutoff for "*_high" features (abnormal if value > this)
-    threshold_high : Optional[float]  cutoff for "*_low" features (abnormal if value < this)
-    unit : Optional[str]           unit the thresholds are expressed in
-    severity_levels : Optional[List[str]]   ordered bands (SEVERITY)
-    threshold_ranges : Optional[Dict[str, Tuple[float, float]]]
-                                   band -> (min, max) interval (SEVERITY)
-    feature_composition : Optional[List[str]]   referenced feature_ids (PATTERN)
-    calculation_method : Optional[str]   formula / rule (RATIO, PATTERN)
-    clinical_significance : str    what abnormality this indicates (audit trail)
-    description : str              plain-language description (audit trail)
-    """
-
-    feature_id: str
-    feature_type: str
-    feature_name: str = ""
-    biomarker_id: str = ""
-    threshold_low: Optional[float] = None
-    threshold_high: Optional[float] = None
-    unit: Optional[str] = None
-    severity_levels: Optional[List[str]] = None
-    threshold_ranges: Optional[Dict[str, Tuple[float, float]]] = None
-    feature_composition: Optional[List[str]] = None
-    calculation_method: Optional[str] = None
-    clinical_significance: str = ""
-    description: str = ""
-
-    def as_dict(self) -> Dict[str, Any]:
-        """Serialize to a plain dict (audit / logging / JSON)."""
-        return asdict(self)
+# The FeatureDefinition contract is panel-agnostic and shared by every domain.
+from domains.feature_types import (
+    VALID_FEATURE_TYPES,
+    FeatureDefinition,
+    validate_feature_definition,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -314,7 +276,19 @@ COMPUTED_RATIO_FEATURES: Dict[str, FeatureDefinition] = {
         feature_type="RATIO",
         calculation_method="mcv / rbc",
         clinical_significance="differentiates_iron_deficiency_vs_thalassemia",
-        description="Mentzer index; > 13 suggests iron deficiency, < 13 suggests thalassemia trait.",
+        threshold_high=13.0,
+        description="Mentzer index; > 13 suggests iron deficiency, < 13 suggests thalassemia "
+                    "trait. Emits the binary fact mentzer_index_low below 13.",
+    ),
+    "mcv_xuln": FeatureDefinition(
+        feature_id="mcv_xuln", feature_name="MCV as a multiple of its upper limit",
+        feature_type="RATIO",
+        calculation_method="mcv_xuln",
+        threshold_low=1.1,
+        clinical_significance="separates_megaloblastic_from_other_macrocytosis",
+        description="MCV / upper reference limit. Above 1.1 (about 110 fL) macrocytosis is "
+                    "usually megaloblastic; below it alcohol, liver and thyroid causes are as "
+                    "likely. Emits mcv_xuln_high.",
     ),
 }
 
@@ -461,53 +435,6 @@ def get_features_by_type(feature_type: str) -> List[FeatureDefinition]:
 def get_patterns() -> List[FeatureDefinition]:
     """Return all PATTERN features (disease patterns + anemia subtypes)."""
     return get_features_by_type("PATTERN")
-
-
-def validate_feature_definition(fd: FeatureDefinition) -> bool:
-    """
-    Validate a feature definition's internal consistency.
-
-    Checks, by type:
-      * feature_id present; feature_type is one of VALID_FEATURE_TYPES
-      * BINARY   — at least one of threshold_low / threshold_high is set
-      * SEVERITY — severity_levels + threshold_ranges set; each band is named in
-                   severity_levels and is a 2-tuple with min <= max
-      * RATIO    — calculation_method set
-      * PATTERN  — feature_composition (non-empty) or calculation_method set
-
-    Returns
-    -------
-    bool
-        True if the definition is well-formed.
-    """
-    if not fd.feature_id or not isinstance(fd.feature_id, str):
-        return False
-    if fd.feature_type not in VALID_FEATURE_TYPES:
-        return False
-
-    if fd.feature_type == "BINARY":
-        return fd.threshold_low is not None or fd.threshold_high is not None
-
-    if fd.feature_type == "SEVERITY":
-        if not fd.severity_levels or not fd.threshold_ranges:
-            return False
-        for band, rng in fd.threshold_ranges.items():
-            if band not in fd.severity_levels:
-                return False
-            if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
-                return False
-            low, high = rng
-            if low is None or high is None or low > high:
-                return False
-        return True
-
-    if fd.feature_type == "RATIO":
-        return bool(fd.calculation_method)
-
-    if fd.feature_type == "PATTERN":
-        return bool(fd.feature_composition) or bool(fd.calculation_method)
-
-    return False
 
 
 __all__ = [
