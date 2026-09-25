@@ -16,7 +16,7 @@ Usage
 Prerequisites (in the environment you run this from)
 ----------------------------------------------------
   - OCR_SPACE_API_KEY in CBC/.env (Layer 1 — OCR.space API; no local OCR install).
-  - Supabase PostgreSQL reachable + seeded (Layer 2 reference ranges) — DATABASE_URL in CBC/.env.
+  - Aurora PostgreSQL reachable + seeded (Layer 2 reference ranges) — DATABASE_URL in CBC/.env.
   - Neo4j reachable (Layer 4) — NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD in CBC/.env.
   - GEMINI_API_KEY in CBC/.env + `pip install google-genai` (Layer 6 reports).
     Any layer that is unavailable degrades gracefully (status partial/error; the

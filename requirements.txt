@@ -1,15 +1,19 @@
 # ── ENERVERA CBC — unified dependencies for the whole project ──
 # One FastAPI service for all six layers. Layer 1 is the OCR.space REST API (no
-# local PaddleOCR/torch), and PostgreSQL is Supabase (asyncpg + psycopg2).
+# local PaddleOCR/torch), and PostgreSQL is AWS Aurora (asyncpg + psycopg2).
 # Mirrors backend/requirements.txt. Pinned to the verified working set (Python
 # 3.11) for reproducible installs:  pip install -r requirements.txt
 
 # ── Layer 1 — OCR.space client ──
 httpx==0.28.1              # calls the OCR.space API + multipart upload streaming
 truststore==0.10.4        # OS trust store for OCR.space + Gemini TLS (corporate proxy)
+pypdf==6.1.1              # splits oversized PDFs into per-page uploads (OCR.space 1.5MB cap)
+boto3==1.40.20            # AWS Textract (OCR_PROVIDER=textract) — table-aware Layer 1
 
-# ── Layer 2 — Normalization (Supabase PostgreSQL) ──
+# ── Layer 2 — Normalization (AWS Aurora PostgreSQL) ──
 SQLAlchemy==2.0.43
+greenlet==3.5.5            # REQUIRED by SQLAlchemy's async engine; SQLAlchemy only
+                            # auto-installs it on some CPUs (not Apple Silicon arm64)
 alembic==1.18.3
 psycopg2-binary==2.9.12    # sync driver — Alembic migrations / seeding
 asyncpg==0.31.0            # async driver — the app (AsyncSession lookups)

@@ -1,8 +1,11 @@
 """
-HTTP routes for the CBC analysis pipeline.
+HTTP routes for the lab-analysis pipeline.
 
 Exposes ``CBCOrchestrator.analyze_cbc()`` (Layers 2→5) as ``POST /api/analyze``:
 raw biomarker values in, clinician-ready findings + clinical flags + audit out.
+The values may belong to any registered panel (CBC, LFT, Lipid — see
+``domains/registry.py``); the orchestrator detects the panel and enforces *its*
+required biomarkers.
 
 Dependency injection
 --------------------
@@ -29,7 +32,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from orchestration.cbc_orchestrator import CBCAnalysisResult, CBCOrchestrator
 from orchestration.layer1_adapter import Layer1ToLayer2Adapter
-from orchestration.ocr_space_client import OCRSpaceClient, OCRSpaceError
+from orchestration.ocr_provider import get_ocr_client
+from orchestration.ocr_space_client import OCRSpaceError
 from services.presentation.report_generator import ReportGenerator
 
 logger = logging.getLogger(__name__)
@@ -37,7 +41,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["analysis"])
 
 # Smallest panel we will attempt to analyse (the orchestrator additionally
-# enforces the specific REQUIRED_BIOMARKERS set and reports it in the result).
+# enforces the detected panel's required_biomarkers and reports it in the result).
 _MIN_BIOMARKERS = 3
 
 
@@ -45,14 +49,21 @@ _MIN_BIOMARKERS = 3
 # Request / response schemas
 # ─────────────────────────────────────────────────────────────────────────────
 class AnalyzeCBCRequest(BaseModel):
-    """Raw CBC panel for one patient."""
+    """Raw panel for one patient (CBC, LFT, or Lipid)."""
 
     patient_id: str = Field(..., description="Caller-defined patient identifier.")
     biomarker_values: Dict[str, float] = Field(
-        ..., description='Canonical code → value, e.g. {"HGB": 10.2, "MCV": 75}.'
+        ...,
+        description='Canonical code → value, e.g. {"HGB": 10.2, "MCV": 75} (CBC) '
+                    'or {"ALT": 180, "AST": 95, "ALP": 210, "TBIL": 3.4, "ALB": 2.8} (LFT).',
     )
     gender: Optional[str] = Field(None, description='Patient gender, "M" or "F".')
     age_years: Optional[int] = Field(None, ge=0, le=150, description="Patient age in years.")
+    pregnant: Optional[bool] = Field(
+        None,
+        description="True applies pregnancy reference ranges (haemoglobin, albumin, ALP) "
+                    "where they exist. Equivalent to metadata {\"condition\": \"pregnancy\"}.",
+    )
     metadata: Optional[Dict[str, Any]] = Field(
         None, description='Optional context, e.g. {"lab_date": "2024-01-15"}.'
     )
@@ -197,7 +208,7 @@ async def analyze_cbc(
     orchestrator: CBCOrchestrator = Depends(get_orchestrator),
 ) -> AnalyzeCBCResponse:
     """
-    Run the full CBC analysis (Layers 2→5) for one patient's biomarker panel.
+    Run the full analysis (Layers 2→5) for one patient's biomarker panel.
 
     HTTP semantics
     --------------
@@ -232,7 +243,8 @@ async def analyze_cbc(
         result: CBCAnalysisResult = await orchestrator.analyze_cbc(
             biomarker_values=request.biomarker_values,
             patient_id=request.patient_id,
-            metadata=request.metadata,
+            metadata={**(request.metadata or {}),
+                      **({"pregnant": True} if request.pregnant else {})},
             gender=request.gender,
             age_years=request.age_years,
             normalizer=normalizer,
@@ -276,10 +288,11 @@ _SUPPORTED_UPLOAD_EXT = (".pdf", ".png", ".jpg", ".jpeg")
 
 @router.post("/analyze-file", response_model=AnalyzeCBCResponse, dependencies=[Depends(api_key_scheme)])
 async def analyze_file(
-    file: UploadFile = File(..., description="CBC report (PDF or image)."),
+    file: UploadFile = File(..., description="Lab report (PDF or image)."),
     patient_id: str = Form(...),
     gender: Optional[str] = Form(None),
     age_years: Optional[int] = Form(None),
+    pregnant: bool = Form(False),
     include_reports: bool = Form(False),
     db: AsyncSession = Depends(get_db),
     orchestrator: CBCOrchestrator = Depends(get_orchestrator),
@@ -311,18 +324,27 @@ async def analyze_file(
     try:
         # STEP 2 — Layer 1: OCR via the OCR.space API
         try:
-            rows = await OCRSpaceClient().extract_biomarkers_from_file(tmp_path)
+            rows = await get_ocr_client().extract_biomarkers_from_file(tmp_path)
         except OCRSpaceError as exc:
-            logger.error("OCR.space error for patient=%s: %s", patient_id, exc)
+            # TextractError subclasses OCRSpaceError, so both providers land here.
+            logger.error("OCR error for patient=%s: %s", patient_id, exc)
             raise HTTPException(status_code=502, detail=f"OCR service error: {exc}") from exc
 
-        # STEP 3 — adapt OCR rows → canonical biomarker dict
-        biomarker_dict, ocr_metadata = Layer1ToLayer2Adapter().convert_ocr_rows_to_biomarker_dict(rows)
-        if not biomarker_dict:
+        # STEP 3 — adapt OCR rows → canonical biomarker dict.
+        # The adapter RAISES when nothing resolves (it never returns an empty
+        # dict), so this must catch ValueError — otherwise the generic handler
+        # below turns "you uploaded a prescription" into an opaque 500.
+        try:
+            biomarker_dict, ocr_metadata = (
+                Layer1ToLayer2Adapter().convert_ocr_rows_to_biomarker_dict(rows)
+            )
+        except ValueError as exc:
+            logger.info("No biomarkers resolved for patient=%s: %s", patient_id, exc)
             raise HTTPException(
                 status_code=422,
-                detail="No biomarkers could be resolved from the report.",
-            )
+                detail="No biomarkers could be resolved from the report. "
+                       "Is this a lab report with numeric results?",
+            ) from exc
         logger.info(
             "POST /api/analyze-file: patient=%s, ocr_rows=%d, resolved=%d",
             patient_id, len(rows), len(biomarker_dict),
@@ -333,7 +355,8 @@ async def analyze_file(
         result: CBCAnalysisResult = await orchestrator.analyze_cbc(
             biomarker_values=biomarker_dict,
             patient_id=patient_id,
-            metadata={"source_file": file.filename, **ocr_metadata},
+            metadata={"source_file": file.filename, **ocr_metadata,
+                      **({"pregnant": True} if pregnant else {})},
             gender=gender,
             age_years=age_years,
             normalizer=normalizer,

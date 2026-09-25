@@ -11,12 +11,16 @@ from __future__ import annotations
 
 from typing import List, Optional, Union
 
-# Fact↔biomarker and code↔graph-name tables live in the domain folder (single
-# source of truth shared with the rest of the pipeline). The live graph mixes
+# Fact↔biomarker and code↔graph-name tables live in the domain folders (single
+# source of truth shared with the rest of the pipeline), merged across every
+# registered panel by the registry. The live graph mixes
 # American node names ("Hemoglobin") with British spelling and synonym nodes
 # (e.g. "RCDW"); CODE_TO_GRAPH_NAMES lists every known form for exact-name
 # matching to avoid substring collisions (e.g. "mch" vs "mchc").
-from domains.cbc.biomarkers import FACT_TO_BIOMARKER, CODE_TO_GRAPH_NAMES
+from domains.registry import merged_code_to_graph_names, merged_fact_to_biomarker
+
+FACT_TO_BIOMARKER = merged_fact_to_biomarker()
+CODE_TO_GRAPH_NAMES = merged_code_to_graph_names()
 
 
 class BiomarkerFactMapping:

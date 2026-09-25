@@ -103,6 +103,20 @@ def reference_range_rows() -> List[Dict[str, Any]]:
         for age_min, age_max in _AGE_BANDS:
             rows.append(_rr(code, None, age_min, age_max, low, high, unit))
 
+    # ── Absolute differential counts (K/uL) — age-specific ──────────────────
+    # Neutropenia and lymphocytosis are defined on these, not on percentages.
+    # Children run higher lymphocyte counts than adults. Benign ethnic
+    # neutropenia (ANC 1.0–1.5) is named in the interpretation rather than
+    # hidden by lowering the limit for everyone.
+    absolute = {
+        "ANC": {(0, 18): (1.5, 8.0), (18, 65): (2.0, 7.5), (65, 150): (2.0, 7.5)},
+        "ALC": {(0, 18): (1.0, 6.5), (18, 65): (1.0, 4.0), (65, 150): (1.0, 4.0)},
+    }
+    for code, bands in absolute.items():
+        for (age_min, age_max), (low, high) in bands.items():
+            rows.append(_rr(code, None, age_min, age_max, low, high, "K/uL",
+                            source_guideline="CLSI/CTCAE generic"))
+
     return rows
 
 

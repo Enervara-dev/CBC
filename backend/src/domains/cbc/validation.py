@@ -29,46 +29,64 @@ from typing import Any, Dict, Optional
 #    flat "normal" (lo, hi). Ranges are half-open [lo, hi). Units in comments.
 # ─────────────────────────────────────────────────────────────────────────────
 SEVERITY_THRESHOLDS: Dict[str, Dict[str, Any]] = {
-    # Hemoglobin (g/dL) — WHO anaemia severity (severe <7, moderate 7–10, mild 10–12 F)
+    # Hemoglobin (g/dL). WHO grades severe anaemia below 8 g/dL in non-pregnant
+    # adults; below 7 is the restrictive transfusion threshold (AABB 2023), so it
+    # is the critical band. The patient's own limit (sex, age, pregnancy) decides
+    # whether a value is low at all — the reasoner floors out-of-range at routine.
     "hemoglobin": {
-        "critical": {"low": (0.0, 5.0), "high": (20.0, 30.0)},
-        "urgent":   {"low": (5.0, 7.0), "high": (18.0, 20.0)},
-        "routine":  {"low": (7.0, 12.0), "high": (16.0, 18.0)},
+        "critical": {"low": (0.0, 7.0), "high": (20.0, 30.0)},
+        "urgent":   {"low": (7.0, 8.0), "high": (18.5, 20.0)},
+        "routine":  {"low": (8.0, 12.0), "high": (16.0, 18.5)},
         "normal":   (12.0, 16.0),
     },
-    # WBC (K/uL) — neutropenia/leukocytosis panic values (CLSI defaults)
+    # WBC (K/uL) — a total below 1.0 is a common critical-call value and above 50
+    # hyperleukocytosis. Infection risk itself is graded on the ANC below.
     "wbc": {
-        "critical": {"low": (0.0, 0.5), "high": (50.0, 100.0)},
-        "urgent":   {"low": (0.5, 1.0), "high": (30.0, 50.0)},
-        "routine":  {"low": (1.0, 4.5), "high": (11.0, 30.0)},
+        "critical": {"low": (0.0, 1.0), "high": (50.0, 100.0)},
+        "urgent":   {"low": (1.0, 2.0), "high": (30.0, 50.0)},
+        "routine":  {"low": (2.0, 4.5), "high": (11.0, 30.0)},
         "normal":   (4.5, 11.0),
     },
-    # Platelets (K/uL) — bleeding risk <20 critical; extreme thrombocytosis high
+    # Absolute neutrophil count (K/uL) — CTCAE v5: < 0.5 grade 4 (severe),
+    # 0.5–1.0 grade 3, 1.0–1.5 grade 2.
+    "absolute_neutrophils": {
+        "critical": {"low": (0.0, 0.5), "high": (0.0, 0.0)},
+        "urgent":   {"low": (0.5, 1.0), "high": (30.0, 100.0)},
+        "routine":  {"low": (1.0, 2.0), "high": (7.5, 30.0)},
+        "normal":   (2.0, 7.5),
+    },
+    # Absolute lymphocyte count (K/uL) — < 0.5 (CTCAE grade 3+) raises the risk of
+    # opportunistic infection; > 30 is lymphoproliferative until shown otherwise.
+    "absolute_lymphocytes": {
+        "urgent":   {"low": (0.0, 0.5), "high": (30.0, 500.0)},
+        "routine":  {"low": (0.5, 1.0), "high": (4.0, 30.0)},
+        "normal":   (1.0, 4.0),
+    },
+    # Platelets (K/uL) — bleeding risk <20 critical, <50 with procedures/trauma
     "platelets": {
         "critical": {"low": (0.0, 20.0), "high": (1000.0, 3000.0)},
         "urgent":   {"low": (20.0, 50.0), "high": (700.0, 1000.0)},
         "routine":  {"low": (50.0, 150.0), "high": (400.0, 700.0)},
         "normal":   (150.0, 400.0),
     },
-    # Hematocrit (%) — tracks hemoglobin
+    # Hematocrit (%) — tracks haemoglobin (critical < 20 pairs with Hb < 7);
+    # > 55 carries hyperviscosity risk
     "hematocrit": {
-        "critical": {"low": (0.0, 15.0), "high": (60.0, 80.0)},
-        "urgent":   {"low": (15.0, 25.0), "high": (55.0, 60.0)},
+        "critical": {"low": (0.0, 20.0), "high": (60.0, 80.0)},
+        "urgent":   {"low": (20.0, 25.0), "high": (55.0, 60.0)},
         "routine":  {"low": (25.0, 36.0), "high": (50.0, 55.0)},
         "normal":   (36.0, 50.0),
     },
-    # RBC count (M/uL)
+    # RBC count (M/uL) — the count is graded through haemoglobin and never exceeds
+    # routine on its own (a high count with a low MCV is thalassaemia trait).
     "rbc": {
-        "critical": {"low": (0.0, 2.0), "high": (8.0, 12.0)},
-        "urgent":   {"low": (2.0, 3.0), "high": (7.0, 8.0)},
-        "routine":  {"low": (3.0, 4.2), "high": (5.9, 7.0)},
+        "routine":  {"low": (0.0, 4.2), "high": (5.9, 12.0)},
         "normal":   (4.2, 5.9),
     },
-    # MCV (fL) — micro/macrocytosis (no true panic value; bands are nominal)
+    # MCV (fL) — classifies an anaemia; there is no panic value, so never above
+    # routine (an MCV of 66 in iron deficiency is not itself an emergency).
     "mcv": {
-        "critical": {"low": (0.0, 60.0), "high": (130.0, 200.0)},
-        "urgent":   {"low": (60.0, 70.0), "high": (115.0, 130.0)},
-        "routine":  {"low": (70.0, 80.0), "high": (100.0, 115.0)},
+        "routine":  {"low": (0.0, 80.0), "high": (100.0, 200.0)},
         "normal":   (80.0, 100.0),
     },
     # MCH (pg) — nominal bands (no panic value)
@@ -95,12 +113,24 @@ SEVERITY_THRESHOLDS: Dict[str, Dict[str, Any]] = {
 #    Finding ids use Layer-3 binary feature ids (e.g. "hemoglobin_low").
 # ─────────────────────────────────────────────────────────────────────────────
 CLINICAL_VALIDATION_RULES: Dict[str, Dict[str, Any]] = {
+    # ── Anaemia by red cell size ──────────────────────────────────────────────
+    # The morphological reading always fires; a specific cause replaces it
+    # (ClinicalCondition.supersedes) only when the indices discriminate.
     "iron_deficiency_anemia": {
-        "required_findings": ["hemoglobin_low", "mcv_low"],
-        "optional_findings": ["rdw_high", "mch_low"],
-        "contradictory_findings": ["macrocytic_anemia", "mcv_high"],
+        "required_findings": ["hemoglobin_low", "mcv_low", "rdw_high"],
+        "optional_findings": ["mch_low", "mchc_low", "platelets_high"],
+        # Mentzer < 13 (many small cells) points to thalassaemia trait instead.
+        "contradictory_findings": ["mcv_high", "mentzer_index_low"],
         "min_confidence": 0.75,
         "severity_factor": 0.9,   # multiply confidence by this at moderate severity
+    },
+    "thalassemia_trait": {
+        "required_findings": ["mcv_low", "mentzer_index_low"],
+        "optional_findings": ["rbc_high", "mch_low", "rdw_normal"],
+        # Raised RDW favours iron deficiency; the trait gives uniform small cells.
+        "contradictory_findings": ["mcv_high", "rdw_high"],
+        "min_confidence": 0.72,
+        "severity_factor": 1.0,
     },
     "microcytic_anemia": {
         "required_findings": ["hemoglobin_low", "mcv_low"],
@@ -116,15 +146,17 @@ CLINICAL_VALIDATION_RULES: Dict[str, Dict[str, Any]] = {
         "min_confidence": 0.70,
         "severity_factor": 0.9,
     },
+    # Megaloblastic range: MCV > 1.1 x upper limit (about 110 fL).
     "vitamin_b12_deficiency": {
-        "required_findings": ["hemoglobin_low", "mcv_high"],
-        "optional_findings": ["rdw_high", "hypersegmented_neutrophils"],
+        "required_findings": ["hemoglobin_low", "mcv_xuln_high"],
+        "optional_findings": ["rdw_high", "wbc_low", "platelets_low",
+                              "absolute_neutrophils_low"],
         "contradictory_findings": ["mcv_low"],
         "min_confidence": 0.72,
         "severity_factor": 0.9,
     },
     "folate_deficiency": {
-        "required_findings": ["hemoglobin_low", "mcv_high"],
+        "required_findings": ["hemoglobin_low", "mcv_xuln_high"],
         "optional_findings": ["rdw_high"],
         "contradictory_findings": ["mcv_low"],
         "min_confidence": 0.70,
@@ -138,31 +170,55 @@ CLINICAL_VALIDATION_RULES: Dict[str, Dict[str, Any]] = {
         "severity_factor": 0.95,
     },
     "chronic_disease_anemia": {
-        "required_findings": ["hemoglobin_low"],
-        "optional_findings": ["mcv_normal", "mcv_low"],
-        "contradictory_findings": ["mcv_high"],
+        "required_findings": ["hemoglobin_low", "mcv_normal"],
+        "optional_findings": ["rdw_normal"],
+        "contradictory_findings": ["mcv_low", "mcv_high", "rdw_high"],
         "min_confidence": 0.65,
         "severity_factor": 0.95,
     },
+    # ── White cells — graded on absolute counts ───────────────────────────────
     "acute_infection": {
-        "required_findings": ["wbc_high"],
-        "optional_findings": ["neutrophils_high", "bands_elevated"],
-        "contradictory_findings": ["wbc_low", "immunosuppression"],
+        "required_findings": ["wbc_high", "absolute_neutrophils_high"],
+        "optional_findings": ["neutrophils_high"],
+        # A lymphocyte-driven leukocytosis is viral or lymphoproliferative.
+        "contradictory_findings": ["wbc_low", "absolute_lymphocytes_high"],
         "min_confidence": 0.70,
         "severity_factor": 1.0,
     },
     "immune_compromise": {
-        "required_findings": ["wbc_low"],
-        "optional_findings": ["lymphocytes_low", "neutrophils_low"],
-        "contradictory_findings": ["wbc_high"],
+        "required_findings": ["absolute_neutrophils_low"],
+        "optional_findings": ["wbc_low", "absolute_lymphocytes_low"],
+        "contradictory_findings": ["absolute_neutrophils_high"],
         "min_confidence": 0.70,
         "severity_factor": 1.0,
     },
+    "marked_leukocytosis": {
+        "required_findings": ["wbc_high"],
+        "optional_findings": ["hemoglobin_low", "platelets_low", "absolute_lymphocytes_high"],
+        "contradictory_findings": [],
+        "min_confidence": 0.75,
+        "severity_factor": 1.0,
+    },
+    # ── Platelets and multi-lineage ──────────────────────────────────────────
     "severe_thrombocytopenia": {
         "required_findings": ["platelets_low"],
         "optional_findings": [],
         "contradictory_findings": ["platelets_high"],
         "min_confidence": 0.75,
+        "severity_factor": 1.0,
+    },
+    "pancytopenia": {
+        "required_findings": ["hemoglobin_low", "wbc_low", "platelets_low"],
+        "optional_findings": ["absolute_neutrophils_low", "mcv_high"],
+        "contradictory_findings": [],
+        "min_confidence": 0.75,
+        "severity_factor": 1.0,
+    },
+    "polycythemia": {
+        "required_findings": ["hemoglobin_high", "hematocrit_high"],
+        "optional_findings": ["rbc_high", "wbc_high", "platelets_high"],
+        "contradictory_findings": ["mcv_low"],
+        "min_confidence": 0.72,
         "severity_factor": 1.0,
     },
 }

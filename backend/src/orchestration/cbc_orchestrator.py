@@ -1,5 +1,5 @@
 """
-CBC orchestrator — chains Layers 2→5 for a CBC panel.
+Analysis orchestrator — chains Layers 2→5 for a lab panel.
 
     raw biomarker values  →  L2 normalize  →  L3 features  →  L4 graph reasoning
                           →  L5 validation  →  CBCAnalysisResult
@@ -7,6 +7,15 @@ CBC orchestrator — chains Layers 2→5 for a CBC panel.
 Per-layer failures are isolated: only Layer 2 is fatal (no normalized values =
 nothing to analyse); L3/L4/L5 failures degrade to ``partial`` and the pipeline
 continues with what it has.
+
+Panel handling
+--------------
+The orchestrator is panel-agnostic: it asks the domain registry which panel(s)
+the submitted codes belong to (:func:`domains.registry.detect_panels`) and
+enforces *that* panel's ``required_biomarkers``. A CBC panel is still checked for
+HGB/MCV/RDW/WBC/PLT; a liver panel is checked for ALT/AST/ALP/TBIL/ALB; a mixed
+report is checked against its dominant panel. The class keeps its ``CBC`` name
+and ``analyze_cbc`` entry point for API compatibility.
 
 Interface adapters (the layer services predate this orchestrator):
   - L2 ``DataNormalizer.normalize(extracted_biomarkers, patient_metadata)`` —
@@ -33,10 +42,12 @@ from models.feature_schemas import (
 from models.graph_schemas import Layer4Output
 from models.normalization_schemas import NormalizedBiomarker as PydNormalizedBiomarker
 from models.validation_schemas import ClinicalFlag, FinalFinding, Layer5Output
-from services.feature_generation.feature_definitions import FEATURE_REGISTRY
 
-# Minimum biomarkers required to run an analysis (per-panel; from the domain).
-from domains.cbc.biomarkers import REQUIRED_BIOMARKERS
+# Which panel a set of codes belongs to, that panel's required biomarkers, and
+# the feature library spanning every registered panel.
+from domains.registry import detect_panels, get_domain, merged_feature_registry
+
+FEATURE_REGISTRY = merged_feature_registry()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,6 +68,11 @@ class NestedAuditTrail:
     layer_timings: Dict[str, float]
     # Populated by CBCFileAnalyzer when the run starts from a file (Layer 1 OCR).
     layer1_ocr: Dict[str, Any] = field(default_factory=dict)
+    # Values the pipeline computed rather than read (ANC/ALC from WBC x %), so a
+    # reader can tell a reported absolute count from a derived one.
+    derived_biomarkers: List[Dict[str, Any]] = field(default_factory=list)
+    # Reference-range condition applied to this patient (e.g. "pregnancy").
+    patient_condition: Optional[str] = None
 
 
 @dataclass
@@ -98,6 +114,52 @@ class CBCAnalysisResult:
 # ─────────────────────────────────────────────────────────────────────────────
 # Orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
+# Differential counts printed as percentages are relative: neutrophils 38% is
+# neutropenia at a WBC of 3.0 and normal at 12.0. Infection risk and every
+# grading scheme (CTCAE, IDSA) use the absolute count, so it is derived whenever
+# a report gives only the WBC and the percentage.
+_ABSOLUTE_FROM_PERCENT: Dict[str, str] = {"ANC": "NEUT", "ALC": "LYMPH"}
+
+
+def _derive_absolute_counts(
+    values: Dict[str, float], units: Dict[str, str]
+) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+    """
+    Add ANC/ALC computed from WBC x percentage when the report omits them.
+
+    The absolute count inherits the WBC's unit (``units`` is updated in place),
+    so "8000 cells/cumm x 58%" converts exactly like the WBC does. A differential
+    whose unit is not a percentage, or whose value cannot be one, is left alone
+    rather than guessed at.
+    """
+    out = dict(values)
+    derived: List[Dict[str, Any]] = []
+    wbc = values.get("WBC")
+    if wbc is None:
+        return out, derived
+    for absolute, percent in _ABSOLUTE_FROM_PERCENT.items():
+        pct = values.get(percent)
+        if absolute in values or pct is None:
+            continue
+        if (units.get(percent) or "%").strip() != "%" or not 0.0 <= pct <= 100.0:
+            continue
+        out[absolute] = round(wbc * pct / 100.0, 4)
+        if units.get("WBC"):
+            units[absolute] = units["WBC"]
+        derived.append({"code": absolute, "from": ["WBC", percent],
+                        "value": out[absolute], "unit": units.get("WBC", "")})
+    return out, derived
+
+
+def _patient_condition(metadata: Dict[str, Any]) -> Optional[str]:
+    """The reference-range ``condition`` for this patient (``"pregnancy"`` or None)."""
+    raw = "pregnancy" if metadata.get("pregnant") is True else metadata.get("condition")
+    if not raw:
+        return None
+    text = str(raw).strip().lower()
+    return "pregnancy" if text in ("pregnancy", "pregnant") else text
+
+
 class CBCOrchestrator:
     """Async orchestrator chaining Layers 2→5 for a CBC panel."""
 
@@ -151,6 +213,7 @@ class CBCOrchestrator:
             self.logger.error("Input validation failed: %s", input_errors)
             return self._error_result(patient_id, started_at, input_errors,
                                        len(biomarker_values), timings, run_start)
+        errors.extend(self._incomplete_panel_notes(biomarker_values))
 
         # Resolve the Layer-2 normalizer (per-request override, else init-time one).
         active_normalizer = normalizer or self.normalizer
@@ -160,16 +223,29 @@ class CBCOrchestrator:
             return self._error_result(patient_id, started_at, errors,
                                        len(biomarker_values), timings, run_start)
 
+        derived: List[Dict[str, Any]] = []
         # STEP 1 — Layer 2: normalization (fatal on failure)
         try:
             t0 = time.perf_counter()
             patient_metadata = {
                 "gender": gender, "age": age_years,
                 "lab_source": metadata.get("lab_name", "Any"),
+                # Pregnancy changes what is normal: haemodilution lowers haemoglobin
+                # and albumin, and placental ALP can double. Without it a healthy
+                # third-trimester ALP of 210 was flagged as cholestasis.
+                "condition": _patient_condition(metadata),
             }
+            # Units come from Layer 1 via the adapter's metadata (``units``). They
+            # matter: without them Layer 2 assumes every value is already in the
+            # standard unit, so a platelet count printed "2.91 lakhs/cumm" is read
+            # as 2.91 K/uL and flagged as critical thrombocytopenia. The JSON
+            # ``/api/analyze`` route sends no units and keeps the old assumption.
+            ocr_units: Dict[str, str] = dict(metadata.get("units") or {})
+            values, derived = _derive_absolute_counts(biomarker_values, ocr_units)
             extracted = [
-                {"name": code, "value": value, "unit": "", "confidence": 1.0}
-                for code, value in biomarker_values.items()
+                {"name": code, "value": value, "unit": ocr_units.get(code, ""),
+                 "confidence": 1.0}
+                for code, value in values.items()
             ]
             layer2_output = await active_normalizer.normalize(extracted, patient_metadata)
             timings["layer2_ms"] = self._ms(t0)
@@ -183,7 +259,10 @@ class CBCOrchestrator:
                                        len(biomarker_values), timings, run_start)
 
         if not layer2_output:
-            errors.append("layer2: no biomarkers normalized")
+            # Say why: "no biomarkers normalized" alone hid a database outage.
+            causes = list(getattr(active_normalizer, "validation_issues", None) or [])[:5]
+            errors.append("layer2: no biomarkers normalized"
+                          + (f" — {'; '.join(causes)}" if causes else ""))
             return self._error_result(patient_id, started_at, errors,
                                        len(biomarker_values), timings, run_start)
 
@@ -238,8 +317,10 @@ class CBCOrchestrator:
         # STEP 5 — thread audit trail + build result
         audit_trail = await self._build_nested_audit_trail(
             layer2_output, layer3_output, layer4_output, layer5_output, timings, patient_id,
-            len(biomarker_values),
+            len(biomarker_values), metadata.get("repeated_biomarkers") or {},
         )
+        audit_trail.derived_biomarkers = derived
+        audit_trail.patient_condition = patient_metadata.get("condition")
 
         if layer5_output is not None:
             final_findings: List[Any] = layer5_output.final_findings
@@ -272,18 +353,69 @@ class CBCOrchestrator:
     async def _validate_inputs(
         self, biomarker_values: Dict[str, float]
     ) -> Tuple[bool, List[str]]:
-        """Check required CBC biomarkers are present and numeric."""
+        """
+        Check the panel is recognised, substantially present, and numeric.
+
+        The required-biomarker set is the *detected* panel's, not always CBC's:
+        a lipid profile must not be rejected for lacking haemoglobin. Codes
+        belonging to other panels are welcome extras — a mixed report is
+        validated against its dominant panel.
+
+        Only a panel with fewer than half of its core markers is refused (a
+        prescription whose one stray match reads as "Hb"). A merely incomplete
+        panel is analysed — see :meth:`_incomplete_panel_notes`.
+        """
         self.logger.debug("Validating inputs: %d biomarkers provided", len(biomarker_values))
         errors: List[str] = []
         if not biomarker_values:
             return False, ["No biomarker values provided."]
-        missing = [b for b in REQUIRED_BIOMARKERS if b not in biomarker_values]
-        if missing:
-            errors.append(f"Missing required biomarkers: {', '.join(missing)}.")
+
+        detection = detect_panels(biomarker_values)
+        if not detection.primary:
+            return False, [
+                "No recognised biomarkers: "
+                f"{', '.join(detection.unknown)} match no registered panel."
+            ]
+        for panel_key in detection.primary:
+            panel = get_domain(panel_key)
+            required = panel.required_biomarkers
+            present = [b for b in required if b in biomarker_values]
+            if len(present) * 2 < len(required):
+                errors.append(
+                    f"Too few biomarkers for the {panel.name} panel: need at least "
+                    f"{-(-len(required) // 2)} of {', '.join(required)}; got "
+                    f"{', '.join(present) or 'none'}."
+                )
+        if detection.unknown:
+            self.logger.info("Ignoring unrecognised biomarker code(s): %s",
+                             ", ".join(detection.unknown))
+
         for code, value in biomarker_values.items():
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 errors.append(f"Biomarker {code} has non-numeric value: {value!r}.")
         return (not errors), errors
+
+    @staticmethod
+    def _incomplete_panel_notes(biomarker_values: Dict[str, float]) -> List[str]:
+        """
+        Name the core markers a detected panel lacks, without refusing to analyse.
+
+        Incomplete panels are clinically ordinary: laboratories omit a calculated
+        LDL when triglycerides exceed 400 mg/dL, and "liver enzymes" often arrive
+        without albumin. Rejecting such a report discarded exactly the values that
+        matter most — a triglyceride of 700, an ALT of 3000 — so the analysis runs
+        on what is present and says what was missing (status ``partial``).
+        """
+        notes: List[str] = []
+        for panel_key in detect_panels(biomarker_values).primary:
+            panel = get_domain(panel_key)
+            missing = [b for b in panel.required_biomarkers if b not in biomarker_values]
+            if missing:
+                notes.append(
+                    f"Incomplete {panel.name} panel: {', '.join(missing)} not reported — "
+                    "analysed the markers present."
+                )
+        return notes
 
     async def _build_nested_audit_trail(
         self,
@@ -294,14 +426,29 @@ class CBCOrchestrator:
         timings: Dict[str, float],
         patient_id: str,
         biomarker_input_count: int,
+        repeated_biomarkers: Optional[Dict[str, List[float]]] = None,
     ) -> NestedAuditTrail:
         """Combine each layer's audit (or an empty dict if it failed)."""
         quality_issues = sum(len(getattr(nb, "quality_issues", []) or []) for nb in layer2_output)
+        detection = detect_panels(nb.biomarker_id for nb in layer2_output)
         layer2_audit = {
             "biomarkers_normalized": len(layer2_output),
             "quality_issues": quality_issues,
+            "panels_detected": detection.matched,
+            "primary_panel": detection.primary,
             "execution_ms": timings["layer2_ms"],
         }
+        # A document holding two draws is analysed on its first panel only; say so
+        # rather than presenting the blend as one result set.
+        if repeated_biomarkers:
+            layer2_audit["repeated_biomarkers"] = repeated_biomarkers
+            layer2_audit["repeated_biomarkers_note"] = (
+                "These biomarkers were resolved from more than one line of the source "
+                "document; only the first occurrence of each was analysed. The document "
+                "may contain multiple panels or draws, or another row (a ratio, an "
+                "absolute count, a method or reference-range line) may have resolved to "
+                "the same code. Worth a human check."
+            )
         layer3_audit = {
             "binary_features_generated": (
                 len(layer3_output.generated_features) if layer3_output else 0

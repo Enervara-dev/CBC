@@ -1,9 +1,10 @@
 """
 Severity classifier — map a biomarker value to a severity band.
 
-Severity bands and their numeric ranges come from ``SEVERITY_FEATURES`` in
-``feature_definitions.py`` (the single source of truth), so clinical thresholds
-live in one auditable place. The classifier is static / stateless.
+Severity bands and their numeric ranges come from the SEVERITY feature definitions
+of every registered domain (``domains/<panel>/features.py`` — the single source of
+truth), so clinical thresholds live in one auditable place per panel. The
+classifier is static / stateless.
 
 Example (Hemoglobin, g/dL):
     critical : 0.0 – 3.0
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, List, Tuple
 
-from services.feature_generation.feature_definitions import SEVERITY_FEATURES
+from domains.registry import merged_feature_registry
 
 if TYPE_CHECKING:  # type-only; avoids importing the sqlalchemy-backed normalizer
     from services.normalization.normalizer import NormalizedBiomarker
@@ -27,17 +28,18 @@ class SeverityClassifier:
     """
     Static severity classification driven by the SEVERITY_FEATURES definitions.
 
-    A severity feature is keyed by its biomarker (HGB/WBC/PLT) and carries a
-    ``threshold_ranges`` dict of ``band -> (low, high)``. Classification finds the
-    band whose half-open interval ``[low, high)`` contains the value (clamped at
-    the extremes).
+    A severity feature is keyed by its biomarker (HGB/WBC/PLT, ALT, TRIG, …) and
+    carries a ``threshold_ranges`` dict of ``band -> (low, high)``. Classification
+    finds the band whose half-open interval ``[low, high)`` contains the value
+    (clamped at the extremes).
     """
 
-    # biomarker_id -> band -> (low, high)
+    # biomarker_id -> band -> (low, high), across every registered panel
     _THRESHOLDS_BY_BIOMARKER: Dict[str, Dict[str, Tuple[float, float]]] = {
         fd.biomarker_id: fd.threshold_ranges
-        for fd in SEVERITY_FEATURES.values()
-        if fd.biomarker_id and fd.threshold_ranges
+        for fd in merged_feature_registry().values()
+        if getattr(fd, "feature_type", "") == "SEVERITY"
+        and fd.biomarker_id and fd.threshold_ranges
     }
 
     @staticmethod

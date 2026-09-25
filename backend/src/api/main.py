@@ -1,5 +1,5 @@
 """
-FastAPI application for the ENERVERA CBC pipeline.
+FastAPI application for the ENERVERA lab-analysis pipeline (CBC, LFT, Lipid).
 
 Run from ``backend/src``:
 
@@ -48,13 +48,18 @@ from api.routes import (  # noqa: E402
 )
 from db.config import get_settings  # noqa: E402
 from db.session import get_async_engine  # noqa: E402
+from domains.registry import (  # noqa: E402
+    available_domains,
+    merged_feature_registry,
+    merged_validation_rules,
+)
 from orchestration.cbc_orchestrator import CBCOrchestrator  # noqa: E402
+from orchestration.ocr_provider import configured_provider  # noqa: E402
 from services.presentation.llm_client import GeminiLLMClient  # noqa: E402
 from services.presentation.report_generator import ReportGenerator  # noqa: E402
+from services.clinical_reasoning import CompositeReasoner  # noqa: E402
 from services.confidence_validation.confidence_calibrator import ConfidenceCalibrator  # noqa: E402
 from services.confidence_validation.validation_engine import ConfidenceValidationEngine  # noqa: E402
-from services.confidence_validation.validation_rules import load_validation_rules  # noqa: E402
-from services.feature_generation.feature_definitions import FEATURE_REGISTRY  # noqa: E402
 from services.feature_generation.feature_generator import FeatureGenerator  # noqa: E402
 from services.graph_reasoning.graph_contract import load_contract  # noqa: E402
 from services.graph_reasoning.neo4j_connection import Neo4jConnection  # noqa: E402
@@ -97,8 +102,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Database unavailable at startup (%s); /api/analyze will 503.", exc)
 
-        # ── Layer 3 — feature generation (stateless singleton)
-        layer3_feature_gen = FeatureGenerator(FEATURE_REGISTRY)
+        # ── Layer 3 — feature generation (stateless singleton). The feature
+        # library spans every registered panel (CBC, LFT, Lipid, …).
+        logger.info("Registered panels: %s", ", ".join(available_domains()))
+        logger.info("Layer 1 OCR provider: %s", configured_provider())
+        layer3_feature_gen = FeatureGenerator(merged_feature_registry())
 
         # ── Layer 4 — graph reasoning (contract-driven; Neo4j connect best-effort)
         neo4j = Neo4jConnection()
@@ -112,12 +120,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         graph_contract = load_contract()
         logger.info("Graph Contract loaded: v%s (%s)",
                     graph_contract.version, graph_contract.source_path)
-        layer4_graph_reasoner = GraphReasoningEngine(
+        graph_reasoner = GraphReasoningEngine(
             neo4j_connection=neo4j, logger=logger, contract=graph_contract,
         )
+        # Layer 4 = deterministic clinical rules ALWAYS, graph findings merged on
+        # top when Neo4j answers. The graph covers CBC only and is frequently
+        # unreachable; making it the sole reasoner meant an abnormal LFT or lipid
+        # panel produced no findings at all.
+        layer4_graph_reasoner = CompositeReasoner(
+            graph_reasoner=graph_reasoner, logger_=logger,
+        )
 
-        # ── Layer 5 — confidence validation (stateless singleton)
-        rules = load_validation_rules()
+        # ── Layer 5 — confidence validation (stateless singleton), with every
+        # panel's rule sets (escalation stays panel-specific — see the registry).
+        rules = merged_validation_rules()
         layer5_validator = ConfidenceValidationEngine(
             confidence_calibrator=ConfidenceCalibrator(rules),
             validation_rules=rules,
@@ -134,7 +150,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         init_orchestrator(orchestrator)
         app.state.neo4j = neo4j
-        logger.info("CBC orchestrator initialized.")
+        logger.info("Orchestrator initialized (Layer 4: clinical rules + graph merge).")
 
         # ── Layer 6 — LLM presentation (best-effort; needs GEMINI_API_KEY)
         if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):

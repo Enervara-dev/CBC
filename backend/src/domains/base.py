@@ -23,6 +23,26 @@ class DomainConsistencyError(ValueError):
     """
 
 
+# The five tables a domain's ``units.py`` provides (all keyed by canonical name).
+UNIT_RULE_KEYS: Tuple[str, ...] = (
+    "conversion_factors",   # name -> {unit: factor to the standard unit}
+    "standard_units",       # name -> standard unit (the factor-1.0 one)
+    "absolute_limits",      # name -> {"min": x, "max": y}  (physiologically possible)
+    "critical_values",      # name -> {"low": x, "high": y} (panic values)
+    "display_names",        # name -> human label for quality messages
+)
+
+
+def _no_unit_rules() -> Dict[str, Any]:
+    """Default for domains that declare no unit / quality tables."""
+    return {key: {} for key in UNIT_RULE_KEYS}
+
+
+def _no_clinical_data() -> Dict[str, Any]:
+    """Default for domains with no clinical interpretation catalogue yet."""
+    return {}
+
+
 @dataclass(frozen=True)
 class DomainConfig:
     """Everything panel-specific, in one object.
@@ -43,6 +63,17 @@ class DomainConfig:
         Callable returning the Layer-5 rule bundle (lazy so import stays cheap).
     reference_range_rows :
         Callable returning the reference-range seed rows for the database.
+    clinical_conditions / biomarker_interpretations :
+        Callables returning the Layer-4 interpretation catalogue — what an
+        abnormal result *means* and what to do about it (see
+        ``<domain>/conditions.py`` and ``domains/clinical_types.py``). Empty for a
+        panel that has not authored them yet; the reasoner simply reports the
+        abnormality without narrative.
+    unit_rules :
+        Callable returning this panel's unit-conversion and data-quality tables
+        (see ``<domain>/units.py`` and :func:`unit_rule_keys`). Keyed by the
+        canonical *name* (``code_to_name`` values), which is what Layer 2's
+        ``UnitConverter`` / ``DataQualityChecker`` are keyed by.
     """
 
     key: str
@@ -57,6 +88,9 @@ class DomainConfig:
     feature_registry: Dict[str, Any]
     validation_rules: Callable[[], Dict[str, Any]]
     reference_range_rows: Callable[[], List[Dict[str, Any]]]
+    unit_rules: Callable[[], Dict[str, Any]] = _no_unit_rules
+    clinical_conditions: Callable[[], Dict[str, Any]] = _no_clinical_data
+    biomarker_interpretations: Callable[[], Dict[str, Any]] = _no_clinical_data
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -99,12 +133,52 @@ def check_domain(config: DomainConfig) -> List[str]:
     range_codes = {row.get("biomarker_id") for row in config.reference_range_rows()}
     _missing("reference_range_rows biomarker_ids", range_codes)
 
+    # Unit / quality tables are keyed by canonical NAME (not code): a typo there
+    # silently disables unit conversion and the panic-value check for that marker.
+    known_names = set(config.code_to_name.values())
+    tables = unit_rule_tables(config)
+    for table_name in UNIT_RULE_KEYS:
+        unknown = sorted(set(tables[table_name]) - known_names)
+        if unknown:
+            problems.append(
+                f"unit_rules[{table_name!r}] reference unknown name(s) {unknown} "
+                "(not a code_to_name value)"
+            )
+    # Clinical interpretation tables must reference real codes and real rules, or
+    # a finding the reasoner tries to explain silently loses its narrative.
+    from domains.clinical_types import validate_conditions, validate_interpretations
+
+    interpretations = config.biomarker_interpretations() or {}
+    if interpretations:
+        problems.extend(validate_interpretations(interpretations, config.code_to_name))
+    conditions = config.clinical_conditions() or {}
+    if conditions:
+        rules = (config.validation_rules() or {}).get("clinical_validation_rules", {})
+        problems.extend(validate_conditions(conditions, rules))
+
+    # Every convertible marker needs a standard unit, or conversion has no target.
+    without_standard = sorted(set(tables["conversion_factors"]) - set(tables["standard_units"]))
+    if without_standard:
+        problems.append(f"unit_rules: conversion_factors without a standard unit: {without_standard}")
+    for name, unit in tables["standard_units"].items():
+        factors = tables["conversion_factors"].get(name, {})
+        if factors and factors.get(unit) != 1.0:
+            problems.append(
+                f"unit_rules: standard unit {unit!r} for {name!r} must have factor 1.0"
+            )
+
     # Required biomarkers must also have a reference range, or they can't normalize.
     missing_ranges = sorted(set(config.required_biomarkers) - {c for c in range_codes if c})
     if missing_ranges:
         problems.append(f"required_biomarkers without a reference range: {missing_ranges}")
 
     return problems
+
+
+def unit_rule_tables(config: DomainConfig) -> Dict[str, Dict[str, Any]]:
+    """Return ``config``'s unit/quality tables with every expected key present."""
+    provided = config.unit_rules() or {}
+    return {key: dict(provided.get(key) or {}) for key in UNIT_RULE_KEYS}
 
 
 def validate_domain(config: DomainConfig) -> None:

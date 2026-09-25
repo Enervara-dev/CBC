@@ -27,8 +27,13 @@ from services.normalization.unit_converter import UnitConverter
 from services.normalization.reference_lookup import ReferenceRangeLookup
 from services.normalization.data_quality import DataQualityChecker
 
-# Per-panel vocabulary lives in the domain folder (single source of truth).
-from domains.cbc.biomarkers import NAME_TO_CODE, CODE_TO_NAME, CODE_TO_LOINC
+# Per-panel vocabulary lives in the domain folders (single source of truth); the
+# registry merges every registered panel so one normalizer serves CBC, LFT, Lipid…
+from domains.registry import merged_code_to_loinc, merged_code_to_name, merged_name_to_code
+
+NAME_TO_CODE = merged_name_to_code()
+CODE_TO_NAME = merged_code_to_name()
+CODE_TO_LOINC = merged_code_to_loinc()
 
 logger = logging.getLogger(__name__)
 
@@ -167,14 +172,33 @@ class DataNormalizer:
         #      - raw unit recognized (case-insensitively) → convert to standard;
         #      - raw unit missing or unrecognized → assume already in standard unit.
         std_value, std_unit = value, (raw_unit or "")
+        unit_issues: List[str] = []
         if canonical_name in UnitConverter.CONVERSION_FACTORS:
             factors = UnitConverter.CONVERSION_FACTORS[canonical_name]
             raw = (raw_unit or "").strip()
-            match = next((u for u in factors if u.lower() == raw.lower()), None) if raw else None
+            match = UnitConverter._resolve_unit(canonical_name, raw) if raw else None
             if match:
                 std_value, std_unit = self.unit_converter.convert(canonical_name, value, match)
+                if match.lower() != raw.lower():
+                    unit_issues.append(
+                        f"Unit {raw!r} for {canonical_name} read as {match!r} "
+                        "(OCR-tolerant match); confirm against the report."
+                    )
             else:
                 std_value, std_unit = value, UnitConverter.STANDARD_UNITS[canonical_name]
+                if raw:
+                    # The report stated a unit we do not know. Assuming it is
+                    # already the standard unit is a guess, and a wrong guess is
+                    # how "2.91 lakhs/cumm" became critical thrombocytopenia — so
+                    # record it instead of proceeding silently.
+                    unit_issues.append(
+                        f"Unrecognized unit {raw!r} for {canonical_name}; value assumed "
+                        f"to be in {std_unit}. Add it to the domain's units.py if this "
+                        "unit is real."
+                    )
+                    logger.warning(
+                        "Unrecognized unit %r for %s — assuming %s", raw, canonical_name, std_unit
+                    )
 
         # 3. Reference range (patient-aware, with fallback)
         gender = patient_metadata.get("gender")
@@ -210,7 +234,7 @@ class DataNormalizer:
             deviation_from_min=deviation_from_min,
             deviation_percent=deviation_percent,
             extraction_confidence=confidence,
-            quality_issues=quality["quality_issues"],
+            quality_issues=unit_issues + quality["quality_issues"],
             critical_flag=quality["critical_flag"],
             loinc_code=CODE_TO_LOINC.get(code),
         )

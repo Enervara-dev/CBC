@@ -60,6 +60,29 @@ class TestConsistencyChecks:
     def test_validate_domain_passes_for_cbc(self):
         validate_domain(CBC_DOMAIN)  # should not raise
 
+    def test_unit_rule_for_unknown_name_is_flagged(self):
+        """Unit/quality tables are keyed by canonical NAME; a typo there silently
+        disables conversion and the panic-value check for that marker."""
+        bad = self._mutate(
+            unit_rules=lambda: {"conversion_factors": {"haemoglobin": {"g/dL": 1.0}},
+                                "standard_units": {"haemoglobin": "g/dL"}},
+        )
+        problems = check_domain(bad)
+        assert any("haemoglobin" in p for p in problems)
+
+    def test_conversion_without_standard_unit_is_flagged(self):
+        bad = self._mutate(
+            unit_rules=lambda: {"conversion_factors": {"hemoglobin": {"g/dL": 1.0}}},
+        )
+        assert any("without a standard unit" in p for p in check_domain(bad))
+
+    def test_standard_unit_must_have_factor_one(self):
+        bad = self._mutate(
+            unit_rules=lambda: {"conversion_factors": {"hemoglobin": {"g/L": 0.1}},
+                                "standard_units": {"hemoglobin": "g/L"}},
+        )
+        assert any("must have factor 1.0" in p for p in check_domain(bad))
+
 
 class TestDifferentialMarkerWiring:
     """NEUT/LYMPH must be fully wired (regression: they were seeded + featured but

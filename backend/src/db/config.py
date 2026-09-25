@@ -1,7 +1,7 @@
 """
 Application settings, loaded from the project-root ``.env`` (``CBC/.env``).
 
-Database (Supabase PostgreSQL):
+Database (AWS Aurora PostgreSQL — ``cbc`` database on ``enervara-aurora-pg17``):
   - ``DATABASE_URL``         the connection string for the whole app. The async
                              (asyncpg) and sync (psycopg2) drivers are derived from
                              it in ``db.session`` — one URL is enough.
@@ -26,7 +26,7 @@ _ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 class Settings(BaseSettings):
     """Environment-backed settings."""
 
-    database_url: str = ""           # Supabase connection string (drivers derived in db.session)
+    database_url: str = ""           # Aurora PostgreSQL connection string (drivers derived in db.session)
     alembic_database_url: str = ""   # optional explicit sync URL override for Alembic / seeding
     # Deployment environment: prefer ENVIRONMENT, accept legacy APP_ENV.
     app_env: str = Field(

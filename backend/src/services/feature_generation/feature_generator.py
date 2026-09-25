@@ -26,6 +26,7 @@ import logging
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from domains.registry import merged_code_to_name
 from services.feature_generation.feature_definitions import FeatureDefinition
 from services.feature_generation.severity_classifier import SeverityClassifier
 
@@ -35,12 +36,10 @@ if TYPE_CHECKING:  # type-only import (keeps sqlalchemy out of this module)
 logger = logging.getLogger(__name__)
 
 
-# Canonical biomarker code → the base name used in feature ids / ratio formulas.
-CODE_TO_BASE: Dict[str, str] = {
-    "HGB": "hemoglobin", "HCT": "hematocrit", "RBC": "rbc", "WBC": "wbc",
-    "PLT": "platelets", "MCV": "mcv", "MCH": "mch", "MCHC": "mchc",
-    "RDW": "rdw", "NEUT": "neutrophils", "LYMPH": "lymphocytes",
-}
+# Canonical biomarker code → the base name used in feature ids / ratio formulas
+# (``HGB`` → ``hemoglobin`` → ``hemoglobin_low``). This is exactly each domain's
+# ``code_to_name`` table, merged across every registered panel.
+CODE_TO_BASE: Dict[str, str] = merged_code_to_name()
 
 _STATUS_SUFFIX = {"LOW": "low", "HIGH": "high", "NORMAL": "normal"}
 
@@ -179,34 +178,77 @@ class FeatureGenerator:
     async def _compute_ratio_features(
         self, biomarkers: List["NormalizedBiomarker"]
     ) -> List[GeneratedFeature]:
-        """Compute ratio features; silently skip any with missing operands."""
-        base_values = {
-            CODE_TO_BASE[b.biomarker_id]: b.value
-            for b in biomarkers
-            if b.biomarker_id in CODE_TO_BASE and b.value is not None
-        }
+        """
+        Compute ratio features; silently skip any with missing operands.
+
+        Operands are canonical names (``ast / alt``). ``<name>_xuln`` is the value
+        as a multiple of *this patient's* upper reference limit, which is how liver
+        enzymes are interpreted (the R factor, "ALP > 1.5 x ULN") and why it follows
+        the sex/age/pregnancy range Layer 2 applied. A method without ``/`` is a
+        single operand, so ``alp_xuln`` on its own is a feature.
+
+        A ratio whose definition carries a threshold also emits a BINARY fact —
+        ``<id>_high`` when value > ``threshold_low``, ``<id>_low`` when value <
+        ``threshold_high`` (the binary threshold convention) — because Layer 4
+        conditions match binary facts, and "AST/ALT > 2" is exactly such a fact.
+        """
+        base_values: Dict[str, float] = {}
+        for b in biomarkers:
+            base = CODE_TO_BASE.get(b.biomarker_id)
+            if base is None or b.value is None:
+                continue
+            base_values[base] = b.value
+            upper = getattr(b, "reference_max", None)
+            if upper:   # one-sided ranges (lipids) have no upper limit to scale by
+                base_values[f"{base}_xuln"] = b.value / upper
+
         features: List[GeneratedFeature] = []
         for feature_id, fd in self.ratio_features.items():
             method = (fd.calculation_method or "").strip()
-            if "/" not in method:
-                logger.debug("Ratio %s: unsupported method %r — skipping", feature_id, method)
+            if not method:
                 continue
-            numerator_name, denominator_name = (p.strip() for p in method.split("/", 1))
-            numerator = base_values.get(numerator_name)
-            denominator = base_values.get(denominator_name)
-            if numerator is None or denominator is None:
+            names = [p.strip() for p in method.split("/", 1)]
+            operands = {name: base_values.get(name) for name in names}
+            if any(v is None for v in operands.values()):
                 logger.info("Ratio %s: missing operand(s) — skipping", feature_id)
                 continue
-            if denominator == 0:
-                logger.info("Ratio %s: division by zero — skipping", feature_id)
-                continue
-            value = round(numerator / denominator, 4)
+            if len(names) == 2:
+                if operands[names[1]] == 0:
+                    logger.info("Ratio %s: division by zero — skipping", feature_id)
+                    continue
+                value = round(operands[names[0]] / operands[names[1]], 4)
+            else:
+                value = round(operands[names[0]], 4)
+            detail = {"method": method, **operands}
             features.append(GeneratedFeature(
                 feature_id=feature_id,
                 feature_type="RATIO",
                 value=value,
                 clinical_significance=fd.clinical_significance,
                 description=fd.description,
-                detail={"method": method, numerator_name: numerator, denominator_name: denominator},
+                detail=detail,
             ))
+            features.extend(self._ratio_facts(feature_id, fd, value, detail))
         return features
+
+    @staticmethod
+    def _ratio_facts(
+        feature_id: str, fd: FeatureDefinition, value: float, detail: Dict[str, Any]
+    ) -> List[GeneratedFeature]:
+        """Binary facts for a ratio that crossed its declared threshold(s)."""
+        crossed = []
+        if fd.threshold_low is not None and value > fd.threshold_low:
+            crossed.append((f"{feature_id}_high", ">", fd.threshold_low))
+        if fd.threshold_high is not None and value < fd.threshold_high:
+            crossed.append((f"{feature_id}_low", "<", fd.threshold_high))
+        return [
+            GeneratedFeature(
+                feature_id=fact_id,
+                feature_type="BINARY",
+                value=True,
+                clinical_significance=fd.clinical_significance,
+                description=f"{fd.feature_name} {op} {cutoff:g} (value {value:g})",
+                detail={**detail, "value": value, "cutoff": cutoff},
+            )
+            for fact_id, op, cutoff in crossed
+        ]

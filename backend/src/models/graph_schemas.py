@@ -52,6 +52,20 @@ class ValidatedFinding(BaseModel):
         default_factory=list, description="Biomarker evidence supporting this finding."
     )
     source_pattern: str = Field(..., description="The Layer 3 pattern id that produced this finding.")
+    interpretation: str = Field(
+        default="",
+        description="What this finding means clinically — the 'so what' behind the number. "
+                    "Populated by the reasoner from the domain interpretation tables.",
+    )
+    consider: List[str] = Field(
+        default_factory=list,
+        description="Differential diagnoses / causes worth considering, most likely first.",
+    )
+    critical_note: str = Field(
+        default="",
+        description="Additional statement that applies only when the value reaches a "
+                    "critical band — the 'this needs attention now' sentence.",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
