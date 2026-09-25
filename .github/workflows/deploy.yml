@@ -1,0 +1,74 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: cbc-api
+  ECS_CLUSTER: enervara-mumbai-cluster
+  ECS_SERVICE: cbc-api-service
+  ECS_TASK_FAMILY: cbc-api
+  CONTAINER_NAME: cbc-api
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::341208406542:role/cbc-api-github-actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Render new task definition
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          aws ecs describe-task-definition --task-definition $ECS_TASK_FAMILY --query taskDefinition > taskdef.json
+          python3 - <<'PY'
+          import json, os
+          td = json.load(open('taskdef.json'))
+          for k in ['taskDefinitionArn','revision','status','requiresAttributes','compatibilities',
+                    'registeredAt','registeredBy','deregisteredAt']:
+              td.pop(k, None)
+          image = "{}/{}:{}".format(os.environ['REGISTRY'], os.environ['ECR_REPOSITORY'], os.environ['IMAGE_TAG'])
+          for c in td['containerDefinitions']:
+              if c['name'] == os.environ['CONTAINER_NAME']:
+                  c['image'] = image
+          json.dump(td, open('taskdef-new.json','w'), indent=2)
+          PY
+          aws ecs register-task-definition --cli-input-json file://taskdef-new.json --query 'taskDefinition.taskDefinitionArn' --output text > arn.txt
+          cat arn.txt
+
+      - name: Deploy and wait for stability
+        run: |
+          ARN=$(cat arn.txt)
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --task-definition $ARN
+          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
+          aws ecs describe-services --cluster $ECS_CLUSTER --services $ECS_SERVICE \
+            --query 'services[0].[taskDefinition,runningCount,deployments[0].rolloutState]' --output text
