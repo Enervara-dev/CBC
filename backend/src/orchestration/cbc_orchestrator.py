@@ -88,6 +88,10 @@ class CBCAnalysisResult:
     error_messages: List[str]
     execution_time_ms: float
     recommendations: List[Any] = field(default_factory=list)  # Layer 4 recommendations (for Layer 6)
+    # Layer-2 output kept on the result so adapters (e.g. /api/analyze-url) can
+    # project raw values without re-running normalization. NOT serialized by
+    # to_dict() — existing API payloads are unchanged.
+    normalized_biomarkers: List[Any] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a JSON-ready dict."""
@@ -347,6 +351,7 @@ class CBCOrchestrator:
             final_findings=final_findings, clinical_flags=clinical_flags,
             recommendations=recommendations,
             audit_trail=audit_trail, error_messages=errors, execution_time_ms=total_ms,
+            normalized_biomarkers=list(layer2_output),
         )
 
     # ── Helpers ──────────────────────────────────────────────────────────────

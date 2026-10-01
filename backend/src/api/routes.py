@@ -7,6 +7,13 @@ The values may belong to any registered panel (CBC, LFT, Lipid — see
 ``domains/registry.py``); the orchestrator detects the panel and enforces *its*
 required biomarkers.
 
+Also exposes the file/document entry points, all running the same
+OCR → adapter → orchestrator pipeline via :func:`_analyze_document_file`:
+
+  - ``POST /api/analyze-file`` — multipart upload in, analysis result out.
+  - ``POST /api/analyze-url`` — presigned URL in (adapter for the ENERVERA
+    main app), the main app's extraction contract out.
+
 Dependency injection
 --------------------
 The orchestrator is expensive to build (it owns the Neo4j connection, the DB
@@ -27,10 +34,21 @@ import tempfile
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from api.auth import api_key_scheme
+from api.extraction_contract import (
+    AnalyzeUrlRequest,
+    AnalyzeUrlResponse,
+    build_empty_payload,
+    build_extraction_payload,
+)
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from orchestration.cbc_orchestrator import CBCAnalysisResult, CBCOrchestrator
+from orchestration.document_fetcher import (
+    DocumentFetchError,
+    UnsupportedDocumentError,
+    fetch_document_to_temp_file,
+)
 from orchestration.layer1_adapter import Layer1ToLayer2Adapter
 from orchestration.ocr_provider import get_ocr_client
 from orchestration.ocr_space_client import OCRSpaceError
@@ -198,6 +216,64 @@ async def _build_reports(
         return {"status": "error", "warnings": [f"report_generation_failed: {exc}"]}
 
 
+def _analysis_response(
+    result: CBCAnalysisResult, reports: Optional[Dict[str, Any]]
+) -> "AnalyzeCBCResponse":
+    """Serialize an analysis result into the /analyze response model."""
+    serialized = result.to_dict()
+    return AnalyzeCBCResponse(
+        patient_id=result.patient_id,
+        timestamp=result.timestamp,
+        status=result.status,
+        final_findings=serialized["final_findings"],
+        clinical_flags=serialized["clinical_flags"],
+        recommendations=serialized["recommendations"],
+        reports=reports,
+        audit_trail=serialized["audit_trail"],
+        error_messages=result.error_messages,
+        execution_time_ms=result.execution_time_ms,
+    )
+
+
+async def _analyze_document_file(
+    tmp_path: str,
+    *,
+    patient_id: str,
+    gender: Optional[str],
+    age_years: Optional[int],
+    pregnant: bool,
+    source_name: Optional[str],
+    db: AsyncSession,
+    orchestrator: CBCOrchestrator,
+) -> CBCAnalysisResult:
+    """
+    OCR → adapter → orchestrator for a report already on disk.
+
+    Shared by ``/api/analyze-file`` (uploaded bytes) and ``/api/analyze-url``
+    (a downloaded document) so both run exactly the same pipeline. Raises
+    :class:`OCRSpaceError` when Layer 1 fails and ``ValueError`` when no
+    biomarkers resolve — callers map those to their own HTTP semantics.
+    """
+    rows = await get_ocr_client().extract_biomarkers_from_file(tmp_path)
+    biomarker_dict, ocr_metadata = (
+        Layer1ToLayer2Adapter().convert_ocr_rows_to_biomarker_dict(rows)
+    )
+    logger.info(
+        "Document pipeline: patient=%s, ocr_rows=%d, resolved=%d",
+        patient_id, len(rows), len(biomarker_dict),
+    )
+    normalizer = _normalizer_factory(db)  # caller has verified this is set
+    return await orchestrator.analyze_cbc(
+        biomarker_values=biomarker_dict,
+        patient_id=patient_id,
+        metadata={"source_file": source_name, **ocr_metadata,
+                  **({"pregnant": True} if pregnant else {})},
+        gender=gender,
+        age_years=age_years,
+        normalizer=normalizer,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Endpoint
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,19 +344,7 @@ async def analyze_cbc(
 
     # STEP 5 — Layer 6 reports (opt-in) + serialize
     reports = await _build_reports(result, request.include_reports)
-    serialized = result.to_dict()
-    return AnalyzeCBCResponse(
-        patient_id=result.patient_id,
-        timestamp=result.timestamp,
-        status=result.status,
-        final_findings=serialized["final_findings"],
-        clinical_flags=serialized["clinical_flags"],
-        recommendations=serialized["recommendations"],
-        reports=reports,
-        audit_trail=serialized["audit_trail"],
-        error_messages=result.error_messages,
-        execution_time_ms=result.execution_time_ms,
-    )
+    return _analysis_response(result, reports)
 
 
 _SUPPORTED_UPLOAD_EXT = (".pdf", ".png", ".jpg", ".jpeg")
@@ -322,67 +386,130 @@ async def analyze_file(
         tmp_path = tmp.name
 
     try:
-        # STEP 2 — Layer 1: OCR via the OCR.space API
-        try:
-            rows = await get_ocr_client().extract_biomarkers_from_file(tmp_path)
-        except OCRSpaceError as exc:
-            # TextractError subclasses OCRSpaceError, so both providers land here.
-            logger.error("OCR error for patient=%s: %s", patient_id, exc)
-            raise HTTPException(status_code=502, detail=f"OCR service error: {exc}") from exc
-
-        # STEP 3 — adapt OCR rows → canonical biomarker dict.
-        # The adapter RAISES when nothing resolves (it never returns an empty
-        # dict), so this must catch ValueError — otherwise the generic handler
-        # below turns "you uploaded a prescription" into an opaque 500.
-        try:
-            biomarker_dict, ocr_metadata = (
-                Layer1ToLayer2Adapter().convert_ocr_rows_to_biomarker_dict(rows)
-            )
-        except ValueError as exc:
-            logger.info("No biomarkers resolved for patient=%s: %s", patient_id, exc)
-            raise HTTPException(
-                status_code=422,
-                detail="No biomarkers could be resolved from the report. "
-                       "Is this a lab report with numeric results?",
-            ) from exc
-        logger.info(
-            "POST /api/analyze-file: patient=%s, ocr_rows=%d, resolved=%d",
-            patient_id, len(rows), len(biomarker_dict),
+        result = await _analyze_document_file(
+            tmp_path, patient_id=patient_id, gender=gender, age_years=age_years,
+            pregnant=pregnant, source_name=file.filename, db=db, orchestrator=orchestrator,
         )
-
-        # STEP 4 — Layer 2→5 via the orchestrator (per-request normalizer)
-        normalizer = _normalizer_factory(db)
-        result: CBCAnalysisResult = await orchestrator.analyze_cbc(
-            biomarker_values=biomarker_dict,
-            patient_id=patient_id,
-            metadata={"source_file": file.filename, **ocr_metadata,
-                      **({"pregnant": True} if pregnant else {})},
-            gender=gender,
-            age_years=age_years,
-            normalizer=normalizer,
-        )
+    except OCRSpaceError as exc:
+        # TextractError subclasses OCRSpaceError, so both providers land here.
+        logger.error("OCR error for patient=%s: %s", patient_id, exc)
+        raise HTTPException(status_code=502, detail=f"OCR service error: {exc}") from exc
+    except ValueError as exc:
+        # The adapter RAISES when nothing resolves — 422 beats an opaque 500
+        # for "you uploaded a prescription".
+        logger.info("No biomarkers resolved for patient=%s: %s", patient_id, exc)
+        raise HTTPException(
+            status_code=422,
+            detail="No biomarkers could be resolved from the report. "
+                   "Is this a lab report with numeric results?",
+        ) from exc
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
         logger.exception("Unexpected error analysing file for patient=%s", patient_id)
         raise HTTPException(status_code=500, detail="Internal analysis error.") from exc
     finally:
-        os.unlink(tmp_path)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
-    reports = await _build_reports(result, include_reports)
-    serialized = result.to_dict()
-    return AnalyzeCBCResponse(
-        patient_id=result.patient_id,
-        timestamp=result.timestamp,
-        status=result.status,
-        final_findings=serialized["final_findings"],
-        clinical_flags=serialized["clinical_flags"],
-        recommendations=serialized["recommendations"],
-        reports=reports,
-        audit_trail=serialized["audit_trail"],
-        error_messages=result.error_messages,
-        execution_time_ms=result.execution_time_ms,
+    logger.info(
+        "POST /api/analyze-file complete: patient=%s, status=%s",
+        patient_id, result.status,
     )
+    reports = await _build_reports(result, include_reports)
+    return _analysis_response(result, reports)
+
+
+@router.post("/analyze-url", response_model=AnalyzeUrlResponse, dependencies=[Depends(api_key_scheme)])
+async def analyze_url(
+    payload: AnalyzeUrlRequest,
+    db: AsyncSession = Depends(get_db),
+    orchestrator: CBCOrchestrator = Depends(get_orchestrator),
+) -> AnalyzeUrlResponse:
+    """
+    Adapter for the ENERVERA main application: presigned document URL in,
+    the main app's LabProcessingService extraction contract out.
+
+    The document is downloaded (see ``orchestration/document_fetcher.py`` for
+    the SSRF/size/type hygiene), piped through the exact same
+    OCR → adapter → orchestrator pipeline as ``/api/analyze-file``, and the
+    Layer-2 normalized biomarkers are projected into the main app's wire
+    format. No OCR/normalization/clinical logic is duplicated here.
+
+    HTTP semantics differ from ``/api/analyze-file`` where the caller's UX
+    requires it:
+
+    - 200: always, when a document was read and the pipeline ran — including
+      "no biomarkers resolved" and non-fatal pipeline errors, which return
+      zero panels so the main app surfaces its friendly NO_VALUES_FOUND flow.
+    - 422: URL scheme not http(s), or downloaded bytes are not a PDF/PNG/JPEG.
+    - 502: download failed, OCR service errored, or the pipeline failed
+      fatally inside Layer 2 (a service-side fault, not a document problem).
+    - 500: unexpected server fault.
+    """
+    patient_id = payload.report_id or payload.user_id or "unknown"
+    # The URL carries a signature credential — never log it, log the caller ids.
+    logger.info(
+        "POST /api/analyze-url: report=%s user=%s gender=%s age=%s",
+        payload.report_id, payload.user_id, payload.gender, payload.age_years,
+    )
+    if _normalizer_factory is None:
+        raise HTTPException(status_code=503, detail="Normalizer factory not initialized.")
+
+    # STEP 1 — download the document (securely: scheme allow-list, byte cap,
+    # magic-number type sniff, no redirect following)
+    try:
+        tmp_path, _ext = fetch_document_to_temp_file(payload.document_url, logger=logger)
+    except UnsupportedDocumentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except DocumentFetchError as exc:
+        logger.error("Document download failed for report=%s: %s", payload.report_id, exc)
+        raise HTTPException(status_code=502, detail=f"Could not download document: {exc}") from exc
+
+    # STEP 2 — the same pipeline as /api/analyze-file
+    try:
+        result = await _analyze_document_file(
+            tmp_path, patient_id=patient_id, gender=payload.gender,
+            age_years=payload.age_years, pregnant=bool(payload.pregnant),
+            source_name=payload.file_name, db=db, orchestrator=orchestrator,
+        )
+    except OCRSpaceError as exc:
+        logger.error("OCR error for report=%s: %s", payload.report_id, exc)
+        raise HTTPException(status_code=502, detail=f"OCR service error: {exc}") from exc
+    except ValueError as exc:
+        # Unreadable-as-lab-report is a *document* problem, not a service
+        # fault: answer 200 with zero panels and let the main app say
+        # "we could not read any lab values" in its own voice.
+        logger.info("No biomarkers resolved for report=%s: %s", payload.report_id, exc)
+        return AnalyzeUrlResponse(
+            **build_empty_payload("error", [f"no_biomarkers_resolved: {exc}"])
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected error analysing report=%s", payload.report_id)
+        raise HTTPException(status_code=500, detail="Internal analysis error.") from exc
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    # STEP 3 — a fatal Layer-2 failure (DB down, ranges missing) is a
+    # service-side fault: report it as such rather than as an unreadable doc.
+    if result.status == "error" and any(m.startswith("layer2") for m in result.error_messages):
+        logger.error("Layer 2 fatal for report=%s: %s", payload.report_id, result.error_messages)
+        raise HTTPException(
+            status_code=502,
+            detail="Analysis failed during normalization; see service logs.",
+        )
+
+    # STEP 4 — project into the main app's contract (+ optional Layer 6)
+    body = build_extraction_payload(result)
+    body["reports"] = await _build_reports(result, payload.include_reports)
+    logger.info(
+        "POST /api/analyze-url complete: report=%s, status=%s, panels=%d",
+        payload.report_id, result.status, len(body["panels"]),
+    )
+    return AnalyzeUrlResponse(**body)
 
 
 @router.get("/health", tags=["health"])
